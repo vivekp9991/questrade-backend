@@ -56,3 +56,5 @@ const portfolioSnapshotSchema = new mongoose.Schema({
 
 // Compound index for efficient historical queries
 portfolioSnapshotSchema.index({ accountId: 1, date: -1 });
+
+module.exports = mongoose.model('PortfolioSnapshot', portfolioSnapshotSchema);

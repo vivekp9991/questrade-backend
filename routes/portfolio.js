@@ -13,6 +13,7 @@ const logger = require('../utils/logger');
 router.get('/summary', async (req, res) => {
   try {
     const { accountId } = req.query;
+    console.log(`req :- ${req} , res :- ${res} , accountId :- ${accountId} `);
     const summary = await portfolioCalculator.getPortfolioSummary(accountId);
     
     res.json({
