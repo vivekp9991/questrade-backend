@@ -8,7 +8,8 @@
     "dev": "nodemon server.js",
     "setup": "node setup.js",
     "refresh-token": "node scripts/refreshToken.js",
-    "sync-data": "node scripts/syncData.js"
+    "sync-data": "node scripts/syncData.js",
+    "test-endpoints": "node scripts/testEndpoints.js"
   },
   "dependencies": {
     "express": "^4.18.2",

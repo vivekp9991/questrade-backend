@@ -1,3 +1,10 @@
+const questradeApi = require('./questradeApi');
+const Account = require('../models/Account');
+const Position = require('../models/Position');
+const Symbol = require('../models/Symbol');
+const Activity = require('../models/Activity');
+const MarketQuote = require('../models/MarketQuote');
+const PortfolioSnapshot = require('../models/PortfolioSnapshot');
 /**
  * Calculate a summary of the portfolio for the given account.
  * If a recent snapshot exists it will be returned, otherwise
