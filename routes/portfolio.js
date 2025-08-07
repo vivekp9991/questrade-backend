@@ -13,7 +13,9 @@ const logger = require('../utils/logger');
 router.get('/summary', async (req, res) => {
   try {
     const { accountId } = req.query;
-    console.log(`req :- ${JSON.stringify(req)} , res :- ${JSON.stringify(res)} , accountId :- ${JSON.stringify(accountId)} `);
+      // Avoid logging entire request/response objects as they contain circular references
+    // which cause JSON.stringify to throw and break the endpoint. Log only the data we need.
+    // logger.info('Fetching portfolio summary', { accountId });
     const summary = await portfolioCalculator.getPortfolioSummary(accountId);
     
     res.json({

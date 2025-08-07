@@ -82,6 +82,11 @@ npm run dev
 - `GET /api/market/symbols/:symbols` - Get symbol information
 - `GET /api/market/candles/:symbol` - Get historical price data
 
+### Accounts
+- `GET /api/accounts` - List all accounts
+- `POST /api/accounts` - Create a new account
+
+
 ## Data Models
 
 ### Token

@@ -77,7 +77,7 @@ async function getPortfolioSummary(accountId = null) {
       assetAllocation: []
     };
   } catch (error) {
-    logger.error('Error calculating portfolio summary:', error);
+    // logger.error('Error calculating portfolio summary:', error);
     throw error;
   }
 }
