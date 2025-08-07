@@ -1,3 +1,4 @@
+// models/Activity.js
 const mongoose = require('mongoose');
 
 const activitySchema = new mongoose.Schema({
@@ -22,13 +23,28 @@ const activitySchema = new mongoose.Schema({
   netAmount: Number,
   type: {
     type: String,
-    enum: ['Trade', 'Dividend', 'Interest', 'Deposit', 'Withdrawal', 'Transfer', 'Other'],
+    enum: [
+      'Trade',      // Buy/Sell trades
+      'Dividend',   // Dividend payments
+      'Interest',   // Interest payments
+      'Deposit',    // Money deposits
+      'Withdrawal', // Money withdrawals
+      'Transfer',   // Transfers between accounts
+      'Fee',        // Account fees
+      'Tax',        // Tax withholdings
+      'FX',         // Foreign exchange
+      'Other'       // Catch-all for unknown types
+    ],
+    default: 'Other',
     index: true
   },
   
   // Additional fields for dividends
   isDividend: Boolean,
   dividendPerShare: Number,
+  
+  // Raw type from Questrade (for debugging)
+  rawType: String,
   
   createdAt: {
     type: Date,

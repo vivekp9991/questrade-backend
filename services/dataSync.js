@@ -1,3 +1,4 @@
+// services/dataSync.js
 const questradeApi = require('./questradeApi');
 const Account = require('../models/Account');
 const Position = require('../models/Position');
@@ -70,28 +71,50 @@ class DataSyncService {
     try {
       const { positions } = await questradeApi.getAccountPositions(accountId);
       
-      // Get symbol IDs for batch quote fetch
-      const symbolIds = positions.map(p => p.symbolId);
-      
-      // Fetch symbol details and quotes
-      const [symbolsData, quotesData] = await Promise.all([
-        questradeApi.getSymbols(symbolIds.join(',')),
-        questradeApi.getSnapQuote(symbolIds)
-      ]);
-      
-      const symbolMap = {};
-      const quoteMap = {};
-      
-      if (symbolsData.symbols) {
-        symbolsData.symbols.forEach(sym => {
-          symbolMap[sym.symbolId] = sym;
-        });
+      // If no positions, return early
+      if (!positions || positions.length === 0) {
+        logger.info(`No positions found for account ${accountId}`);
+        return [];
       }
       
-      if (quotesData.quotes) {
-        quotesData.quotes.forEach(quote => {
-          quoteMap[quote.symbolId] = quote;
-        });
+      // Get symbol IDs for batch quote fetch
+      const symbolIds = positions.map(p => p.symbolId).filter(id => id != null);
+      
+      // Only fetch if we have symbol IDs
+      let symbolMap = {};
+      let quoteMap = {};
+      
+      if (symbolIds.length > 0) {
+        try {
+          // Fetch symbols - using comma-separated string
+          const symbolsData = await questradeApi.getSymbols(symbolIds.join(','));
+          
+          if (symbolsData.symbols) {
+            symbolsData.symbols.forEach(sym => {
+              symbolMap[sym.symbolId] = sym;
+            });
+          }
+        } catch (error) {
+          logger.warn(`Could not fetch symbol data: ${error.message}`);
+        }
+        
+        // Try to fetch quotes - this might fail if market data access is not enabled
+        try {
+          const quotesData = await questradeApi.getMarketQuote(symbolIds);
+          
+          if (quotesData.quotes) {
+            quotesData.quotes.forEach(quote => {
+              quoteMap[quote.symbolId] = quote;
+            });
+          }
+        } catch (error) {
+          if (error.message.includes('OAuth scopes')) {
+            logger.warn('Market data access not enabled. Enable it in your Questrade app settings.');
+            logger.warn('Continuing without real-time quotes...');
+          } else {
+            logger.warn(`Could not fetch quote data: ${error.message}`);
+          }
+        }
       }
       
       // Process each position
@@ -131,7 +154,7 @@ class DataSyncService {
             capitalGainValue: totalReturnValue,
             dividendData,
             marketData: {
-              lastPrice: quote.lastTradePrice,
+              lastPrice: quote.lastTradePrice || position.currentPrice,
               bidPrice: quote.bidPrice,
               askPrice: quote.askPrice,
               volume: quote.volume,
@@ -146,7 +169,7 @@ class DataSyncService {
           { upsert: true, new: true }
         );
         
-        // Update symbol information
+        // Update symbol information if we have it
         if (symbolInfo.symbol) {
           await Symbol.findOneAndUpdate(
             { symbolId: position.symbolId },
@@ -179,29 +202,33 @@ class DataSyncService {
           );
         }
         
-        // Save market quote
+        // Save market quote if available
         if (quote.symbol) {
-          await MarketQuote.create({
-            symbol: quote.symbol,
-            symbolId: quote.symbolId,
-            bidPrice: quote.bidPrice,
-            bidSize: quote.bidSize,
-            askPrice: quote.askPrice,
-            askSize: quote.askSize,
-            lastTradePrice: quote.lastTradePrice,
-            lastTradeSize: quote.lastTradeSize,
-            lastTradeTick: quote.lastTradeTick,
-            lastTradeTime: quote.lastTradeTime,
-            volume: quote.volume,
-            openPrice: quote.openPrice,
-            highPrice: quote.highPrice,
-            lowPrice: quote.lowPrice,
-            delay: quote.delay,
-            isHalted: quote.isHalted,
-            VWAP: quote.VWAP,
-            isSnapQuote: quote.isSnapQuote,
-            snapQuoteTime: quote.snapQuoteTime
-          });
+          try {
+            await MarketQuote.create({
+              symbol: quote.symbol,
+              symbolId: quote.symbolId,
+              bidPrice: quote.bidPrice,
+              bidSize: quote.bidSize,
+              askPrice: quote.askPrice,
+              askSize: quote.askSize,
+              lastTradePrice: quote.lastTradePrice,
+              lastTradeSize: quote.lastTradeSize,
+              lastTradeTick: quote.lastTradeTick,
+              lastTradeTime: quote.lastTradeTime,
+              volume: quote.volume,
+              openPrice: quote.openPrice,
+              highPrice: quote.highPrice,
+              lowPrice: quote.lowPrice,
+              delay: quote.delay,
+              isHalted: quote.isHalted,
+              VWAP: quote.VWAP,
+              isSnapQuote: false,
+              snapQuoteTime: new Date()
+            });
+          } catch (error) {
+            logger.warn(`Could not save market quote: ${error.message}`);
+          }
         }
       }
       
@@ -284,30 +311,76 @@ class DataSyncService {
     }
   }
 
+  // Format date for Questrade API (ISO format with timezone)
+  formatQuestradeDate(date) {
+    const d = new Date(date);
+    // Questrade expects ISO format with timezone like: 2011-02-01T00:00:00.000000-05:00
+    const year = d.getFullYear();
+    const month = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    
+    // Use Eastern Time zone offset (-05:00 for EST, -04:00 for EDT)
+    // For simplicity, we'll use -05:00 which Questrade accepts year-round
+    return `${year}-${month}-${day}T00:00:00-05:00`;
+  }
+
   // Sync account activities (dividends, trades, etc.)
   async syncActivities(accountId, startDate = null, endDate = null) {
     try {
       // Default to last 30 days if no dates provided
-      if (!endDate) endDate = new Date().toISOString();
-      if (!startDate) {
-        const start = new Date();
-        start.setDate(start.getDate() - 30);
-        startDate = start.toISOString();
+      if (!endDate) {
+        endDate = new Date();
       }
+      if (!startDate) {
+        startDate = new Date();
+        startDate.setDate(startDate.getDate() - 30);
+      }
+      
+      // Format dates for Questrade API
+      const formattedStartDate = this.formatQuestradeDate(startDate);
+      const formattedEndDate = this.formatQuestradeDate(endDate);
+      
+      logger.info(`Fetching activities from ${formattedStartDate} to ${formattedEndDate}`);
       
       const { activities } = await questradeApi.getAccountActivities(
         accountId, 
-        startDate, 
-        endDate
+        formattedStartDate, 
+        formattedEndDate
       );
       
+      let newActivities = 0;
+      
       for (const activity of activities) {
+        // Normalize activity type
+        let normalizedType = 'Other';
+        const rawType = activity.type || '';
+        
+        if (rawType.toLowerCase().includes('trade')) {
+          normalizedType = 'Trade';
+        } else if (rawType.toLowerCase().includes('dividend')) {
+          normalizedType = 'Dividend';
+        } else if (rawType.toLowerCase().includes('deposit')) {
+          normalizedType = 'Deposit';
+        } else if (rawType.toLowerCase().includes('withdrawal')) {
+          normalizedType = 'Withdrawal';
+        } else if (rawType.toLowerCase().includes('interest')) {
+          normalizedType = 'Interest';
+        } else if (rawType.toLowerCase().includes('transfer')) {
+          normalizedType = 'Transfer';
+        } else if (rawType.toLowerCase().includes('fee')) {
+          normalizedType = 'Fee';
+        } else if (rawType.toLowerCase().includes('tax')) {
+          normalizedType = 'Tax';
+        } else if (rawType.toLowerCase().includes('fx')) {
+          normalizedType = 'FX';
+        }
+        
         // Check if activity already exists
         const exists = await Activity.findOne({
           accountId,
           transactionDate: activity.transactionDate,
           symbol: activity.symbol,
-          type: activity.type,
+          type: normalizedType,
           netAmount: activity.netAmount
         });
         
@@ -327,20 +400,23 @@ class DataSyncService {
             grossAmount: activity.grossAmount,
             commission: activity.commission,
             netAmount: activity.netAmount,
-            type: activity.type,
-            isDividend: activity.type === 'Dividend',
-            dividendPerShare: activity.type === 'Dividend' && activity.quantity > 0 
+            type: normalizedType,
+            rawType: rawType,
+            isDividend: normalizedType === 'Dividend',
+            dividendPerShare: normalizedType === 'Dividend' && activity.quantity > 0 
               ? Math.abs(activity.netAmount) / activity.quantity 
               : 0
           });
+          newActivities++;
         }
       }
       
-      logger.info(`Synced ${activities.length} activities for account ${accountId}`);
+      logger.info(`Synced ${activities.length} activities for account ${accountId} (${newActivities} new)`);
       return activities;
     } catch (error) {
       logger.error(`Error syncing activities for account ${accountId}:`, error);
-      throw error;
+      // Don't throw - activities are not critical for basic functionality
+      return [];
     }
   }
 
@@ -351,7 +427,10 @@ class DataSyncService {
       const positions = await Position.find(query);
       const accounts = await Account.find(query);
       
-      if (positions.length === 0) return null;
+      if (positions.length === 0) {
+        logger.info(`No positions to snapshot for account ${accountId || 'all'}`);
+        return null;
+      }
       
       // Calculate totals
       let totalInvestment = 0;
@@ -391,7 +470,7 @@ class DataSyncService {
         ? (totalReturnValue / totalInvestment) * 100 
         : 0;
       
-      const averageYieldPercent = totalInvestment > 0 
+      const averageYieldPercent = currentValue > 0 
         ? (annualProjectedDividend / currentValue) * 100 
         : 0;
       
@@ -439,7 +518,8 @@ class DataSyncService {
       return snapshot;
     } catch (error) {
       logger.error('Error creating portfolio snapshot:', error);
-      throw error;
+      // Don't throw - snapshots are not critical
+      return null;
     }
   }
 
@@ -458,13 +538,26 @@ class DataSyncService {
         // Skip if specific account requested and doesn't match
         if (accountId && accountId !== accId) continue;
         
-        await Promise.all([
-          this.syncPositions(accId),
-          this.syncActivities(accId)
-        ]);
+        // Sync positions (most important)
+        try {
+          await this.syncPositions(accId);
+        } catch (error) {
+          logger.error(`Failed to sync positions for ${accId}:`, error.message);
+        }
+        
+        // Sync activities (less critical)
+        try {
+          await this.syncActivities(accId);
+        } catch (error) {
+          logger.warn(`Failed to sync activities for ${accId}:`, error.message);
+        }
         
         // Create snapshot after sync
-        await this.createPortfolioSnapshot(accId);
+        try {
+          await this.createPortfolioSnapshot(accId);
+        } catch (error) {
+          logger.warn(`Failed to create snapshot for ${accId}:`, error.message);
+        }
       }
       
       logger.info(`Full sync completed for account ${accountId || 'all'}`);
