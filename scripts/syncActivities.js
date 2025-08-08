@@ -19,39 +19,64 @@ function formatDate(date) {
   return `${year}-${month}-${day}T00:00:00-05:00`;
 }
 
+// Fetch activities in smaller date ranges to avoid API limits
+async function fetchActivitiesInChunks(accountId, startDate, endDate, chunkDays = 30) {
+  let allActivities = [];
+  let currentStart = new Date(startDate);
+
+  while (currentStart <= endDate) {
+    let currentEnd = new Date(currentStart);
+    currentEnd.setDate(currentEnd.getDate() + chunkDays - 1);
+    if (currentEnd > endDate) currentEnd = new Date(endDate);
+
+    const formattedStart = formatDate(currentStart);
+    const formattedEnd = formatDate(currentEnd);
+
+    console.log(`  Fetching range: ${formattedStart} to ${formattedEnd}`);
+
+    try {
+      const resp = await questradeApi.getAccountActivities(
+        accountId,
+        formattedStart,
+        formattedEnd
+      );
+      const activities = resp.activities || [];
+      console.log(`    Retrieved ${activities.length} activities`);
+      allActivities = allActivities.concat(activities);
+    } catch (err) {
+      console.log(`    ⚠️  Failed to fetch range: ${err.message}`);
+    }
+
+    currentStart = new Date(currentEnd);
+    currentStart.setDate(currentStart.getDate() + 1);
+  }
+
+  return allActivities;
+}
+
 async function syncAccountActivities(accountId, days = 30) {
   try {
     console.log(`\nSyncing activities for account ${accountId}...`);
-    
+
     // Calculate date range
     const endDate = new Date();
     const startDate = new Date();
     startDate.setDate(startDate.getDate() - days);
-    
-    const formattedStartDate = formatDate(startDate);
-    const formattedEndDate = formatDate(endDate);
-    
-    console.log(`  Date range: ${formattedStartDate} to ${formattedEndDate}`);
-    
-    try {
-      const response = await questradeApi.getAccountActivities(
-        accountId,
-        formattedStartDate,
-        formattedEndDate
-      );
-      
-      const activities = response.activities || [];
-      console.log(`  Found ${activities.length} activities`);
-      
-      // Group activities by type
-      const activityTypes = {};
-      let newActivities = 0;
-      
-      for (const activity of activities) {
+
+    console.log(`  Date range: ${formatDate(startDate)} to ${formatDate(endDate)}`);
+
+    const activities = await fetchActivitiesInChunks(accountId, startDate, endDate);
+    console.log(`  Found ${activities.length} activities`);
+
+    // Group activities by type
+    const activityTypes = {};
+    let newActivities = 0;
+
+    for (const activity of activities) {
         // Normalize activity type (Questrade returns plural, we store singular)
         let normalizedType = 'Other';
         const rawType = activity.type || '';
-        
+
         // Map Questrade types to our types
         if (rawType.toLowerCase().includes('trade')) {
           normalizedType = 'Trade';
@@ -115,67 +140,41 @@ async function syncAccountActivities(accountId, days = 30) {
             console.log(`    Raw type was: "${rawType}", normalized to: "${normalizedType}"`);
           }
         }
-      }
-      
-      console.log(`  ✅ Synced ${newActivities} new activities`);
-      
-      // Show breakdown
-      if (Object.keys(activityTypes).length > 0) {
-        console.log('\n  Activity breakdown:');
-        for (const [type, count] of Object.entries(activityTypes)) {
-          console.log(`    ${type}: ${count}`);
-        }
-      }
-      
-      // Show dividend summary if any
-      const dividends = activities.filter(a => a.type === 'Dividend');
-      if (dividends.length > 0) {
-        const totalDividends = dividends.reduce((sum, d) => sum + Math.abs(d.netAmount), 0);
-        console.log(`\n  Dividend Summary:`);
-        console.log(`    Total dividends: $${totalDividends.toFixed(2)}`);
-        console.log(`    Number of payments: ${dividends.length}`);
-        
-        // Show recent dividends
-        const recentDividends = dividends
-          .sort((a, b) => new Date(b.transactionDate) - new Date(a.transactionDate))
-          .slice(0, 5);
-        
-        if (recentDividends.length > 0) {
-          console.log(`\n  Recent dividends:`);
-          for (const div of recentDividends) {
-            const date = new Date(div.transactionDate).toLocaleDateString();
-            console.log(`    ${date}: ${div.symbol || 'N/A'} - $${Math.abs(div.netAmount).toFixed(2)}`);
-          }
-        }
-      }
-      
-      return activities;
-    } catch (error) {
-      if (error.message.includes('Argument length exceeds')) {
-        console.log(`  ⚠️  Date range too large, trying smaller range...`);
-        
-        // Try with just last 7 days
-        const endDate = new Date();
-        const startDate = new Date();
-        startDate.setDate(startDate.getDate() - 7);
-        
-        const formattedStartDate = formatDate(startDate);
-        const formattedEndDate = formatDate(endDate);
-        
-        console.log(`  Retrying with: ${formattedStartDate} to ${formattedEndDate}`);
-        
-        const response = await questradeApi.getAccountActivities(
-          accountId,
-          formattedStartDate,
-          formattedEndDate
-        );
-        
-        const activities = response.activities || [];
-        console.log(`  ✅ Found ${activities.length} activities (last 7 days)`);
-        return activities;
-      }
-      throw error;
     }
+
+    console.log(`  ✅ Synced ${newActivities} new activities`);
+
+    // Show breakdown
+    if (Object.keys(activityTypes).length > 0) {
+      console.log('\n  Activity breakdown:');
+      for (const [type, count] of Object.entries(activityTypes)) {
+        console.log(`    ${type}: ${count}`);
+      }
+    }
+
+    // Show dividend summary if any
+    const dividends = activities.filter(a => a.type === 'Dividend');
+    if (dividends.length > 0) {
+      const totalDividends = dividends.reduce((sum, d) => sum + Math.abs(d.netAmount), 0);
+      console.log(`\n  Dividend Summary:`);
+      console.log(`    Total dividends: $${totalDividends.toFixed(2)}`);
+      console.log(`    Number of payments: ${dividends.length}`);
+
+      // Show recent dividends
+      const recentDividends = dividends
+        .sort((a, b) => new Date(b.transactionDate) - new Date(a.transactionDate))
+        .slice(0, 5);
+
+      if (recentDividends.length > 0) {
+        console.log(`\n  Recent dividends:`);
+        for (const div of recentDividends) {
+          const date = new Date(div.transactionDate).toLocaleDateString();
+          console.log(`    ${date}: ${div.symbol || 'N/A'} - $${Math.abs(div.netAmount).toFixed(2)}`);
+        }
+      }
+    }
+
+    return activities;
   } catch (error) {
     console.log(`  ❌ Error: ${error.message}`);
     return [];
