@@ -67,6 +67,7 @@ npm run dev
 ### Authentication
 - `POST /api/auth/refresh-token` - Manually refresh the access token
 - `GET /api/auth/token-status` - Check token status
+- `GET /api/auth/access-token` - Retrieve current access token
 - `POST /api/auth/update-refresh-token` - Update refresh token manually
 
 ### Portfolio

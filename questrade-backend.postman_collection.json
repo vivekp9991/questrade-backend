@@ -1,0 +1,241 @@
+{
+  "info": {
+    "name": "questrade-backend API",
+    "_postman_id": "b12d6ea7-5e6b-4b95-842a-2d148b894a79",
+    "description": "Collection covering all endpoints for questrade-backend",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "base_url", "value": "http://localhost:4000" }
+  ],
+  "item": [
+    {
+      "name": "Authentication",
+      "item": [
+        {
+          "name": "Get token status",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/auth/token-status"
+          }
+        },
+        {
+          "name": "Refresh token",
+          "request": {
+            "method": "POST",
+            "url": "{{base_url}}/api/auth/refresh-token"
+          }
+        },
+        {
+          "name": "Update refresh token",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"token\": \"your_new_refresh_token_here\"\n}"
+            },
+            "url": "{{base_url}}/api/auth/update-refresh-token"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Accounts",
+      "item": [
+        {
+          "name": "Get all accounts",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/accounts"
+          }
+        },
+        {
+          "name": "Create new account",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"number\": \"12345678\",\n  \"type\": \"TFSA\"\n}"
+            },
+            "url": "{{base_url}}/api/accounts"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Portfolio",
+      "item": [
+        {
+          "name": "Portfolio summary (all accounts)",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/portfolio/summary"
+          }
+        },
+        {
+          "name": "Portfolio summary (TFSA account)",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/portfolio/summary?accountId=53413547"
+          }
+        },
+        {
+          "name": "Portfolio summary (FHSA account)",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/portfolio/summary?accountId=53510361"
+          }
+        },
+        {
+          "name": "Portfolio summary (Cash account)",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/portfolio/summary?accountId=40058790"
+          }
+        },
+        {
+          "name": "Get all positions",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/portfolio/positions"
+          }
+        },
+        {
+          "name": "Get positions for account",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/portfolio/positions?accountId=53413547"
+          }
+        },
+        {
+          "name": "Get position details by symbol",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/portfolio/positions/KILO.TO"
+          }
+        },
+        {
+          "name": "Get position details by symbol and account",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/portfolio/positions/GLD?accountId=53413547"
+          }
+        },
+        {
+          "name": "Dividend calendar (all accounts)",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/portfolio/dividends/calendar"
+          }
+        },
+        {
+          "name": "Dividend calendar (specific account)",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/portfolio/dividends/calendar?accountId=53413547"
+          }
+        },
+        {
+          "name": "Dividend calendar (date range)",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/portfolio/dividends/calendar?startDate=2025-07-01&endDate=2025-08-31"
+          }
+        },
+        {
+          "name": "Portfolio snapshots (limit)",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/portfolio/snapshots?limit=10"
+          }
+        },
+        {
+          "name": "Portfolio snapshots (account and limit)",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/portfolio/snapshots?accountId=53413547&limit=5"
+          }
+        },
+        {
+          "name": "Portfolio snapshots (date range)",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/portfolio/snapshots?startDate=2025-08-01&endDate=2025-08-07"
+          }
+        },
+        {
+          "name": "Sync portfolio data",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"fullSync\": false\n}"
+            },
+            "url": "{{base_url}}/api/portfolio/sync"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Market Data",
+      "item": [
+        {
+          "name": "Market quote",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/market/quote/TD.TO"
+          }
+        },
+        {
+          "name": "Market quote (multiple symbols)",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/market/quote/RY.TO,TD.TO,BNS.TO"
+          }
+        },
+        {
+          "name": "Symbol information",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/market/symbols/KILO.TO"
+          }
+        },
+        {
+          "name": "Symbol information (multiple symbols)",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/market/symbols/GLD,VFV.TO,HMAX.TO"
+          }
+        },
+        {
+          "name": "Market candles",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/market/candles/KILO.TO?startTime=2025-08-01T00:00:00-05:00&endTime=2025-08-07T00:00:00-05:00&interval=OneDay"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Health",
+      "item": [
+        {
+          "name": "Server health check",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/health"
+          }
+        }
+      ]
+    }
+  ]
+}

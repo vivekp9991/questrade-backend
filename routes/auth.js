@@ -60,6 +60,36 @@ router.get('/token-status', async (req, res) => {
   }
 });
 
+// Get current access token
+router.get('/access-token', async (req, res) => {
+  try {
+    const tokenDoc = await Token.findOne({
+      type: 'access',
+      isActive: true
+    }).sort({ createdAt: -1 });
+
+    if (!tokenDoc) {
+      return res.status(404).json({
+        success: false,
+        error: 'No active access token found'
+      });
+    }
+
+    res.json({
+      success: true,
+      token: tokenDoc.getDecryptedToken(),
+      expiresAt: tokenDoc.expiresAt
+    });
+  } catch (error) {
+    logger.error('Error getting access token:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to get access token'
+    });
+  }
+});
+
+
 // Manual token update endpoint
 router.post('/update-refresh-token', async (req, res) => {
   try {
