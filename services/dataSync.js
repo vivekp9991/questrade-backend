@@ -240,6 +240,7 @@ class DataSyncService {
     }
   }
 
+
   // Calculate dividend metrics for a position
   async calculateDividendMetrics(accountId, symbol) {
     try {
@@ -257,34 +258,119 @@ class DataSyncService {
           dividendReturnPercent: 0,
           yieldOnCost: 0,
           dividendAdjustedCost: 0,
+          dividendAdjustedCostPerShare: 0,
           monthlyDividend: 0,
-          annualDividend: 0
+          monthlyDividendPerShare: 0,
+          annualDividend: 0,
+          annualDividendPerShare: 0,
+          dividendFrequency: 0
         };
       }
       
       const totalReceived = dividends.reduce((sum, div) => sum + Math.abs(div.netAmount), 0);
       const lastDividend = dividends[0];
       
-      // Get position for cost basis
+      // Get position for cost basis and shares
       const position = await Position.findOne({ accountId, symbol });
       const totalCost = position ? position.totalCost : 0;
+      const shares = position ? position.openQuantity : 0;
+      const avgCost = shares > 0 ? totalCost / shares : 0;
       
-      // Calculate annual dividend based on last 12 months
-      const oneYearAgo = new Date();
-      oneYearAgo.setFullYear(oneYearAgo.getFullYear() - 1);
+      // Determine dividend frequency by analyzing payment patterns
+      let dividendFrequency = 0; // payments per year
+      let monthlyDividendTotal = 0;
+      let annualDividendTotal = 0;
+      let monthlyDividendPerShare = 0;
+      let annualDividendPerShare = 0;
       
-      const recentDividends = dividends.filter(d => 
-        new Date(d.transactionDate) > oneYearAgo
-      );
+      if (dividends.length >= 2) {
+        // Calculate average days between dividends for last year
+        const oneYearAgo = new Date();
+        oneYearAgo.setFullYear(oneYearAgo.getFullYear() - 1);
+        
+        const recentDividends = dividends.filter(d => 
+          new Date(d.transactionDate) > oneYearAgo
+        );
+        
+        if (recentDividends.length >= 2) {
+          // Calculate frequency based on payment patterns
+          const daysBetweenPayments = [];
+          for (let i = 0; i < recentDividends.length - 1; i++) {
+            const days = Math.abs(
+              (new Date(recentDividends[i].transactionDate) - new Date(recentDividends[i + 1].transactionDate)) 
+              / (1000 * 60 * 60 * 24)
+            );
+            daysBetweenPayments.push(days);
+          }
+          
+          const avgDaysBetween = daysBetweenPayments.reduce((a, b) => a + b, 0) / daysBetweenPayments.length;
+          
+          // Determine frequency based on average days between payments
+          if (avgDaysBetween <= 35) {
+            dividendFrequency = 12; // Monthly
+          } else if (avgDaysBetween <= 100) {
+            dividendFrequency = 4;  // Quarterly
+          } else if (avgDaysBetween <= 200) {
+            dividendFrequency = 2;  // Semi-annual
+          } else {
+            dividendFrequency = 1;  // Annual
+          }
+          
+          // Calculate based on most recent dividend and frequency
+          const lastDividendAmount = Math.abs(lastDividend.netAmount);
+          
+          // Get dividend per share from the last dividend
+          const lastDividendPerShare = lastDividend.quantity > 0 
+            ? lastDividendAmount / lastDividend.quantity 
+            : (shares > 0 ? lastDividendAmount / shares : 0);
+          
+          // Project annual amounts
+          annualDividendPerShare = lastDividendPerShare * dividendFrequency;
+          annualDividendTotal = annualDividendPerShare * shares;
+          
+          // Calculate monthly amounts
+          monthlyDividendPerShare = annualDividendPerShare / 12;
+          monthlyDividendTotal = annualDividendTotal / 12;
+          
+        } else {
+          // If we only have one recent dividend, estimate based on that
+          const lastDividendAmount = Math.abs(lastDividend.netAmount);
+          const lastDividendPerShare = lastDividend.quantity > 0 
+            ? lastDividendAmount / lastDividend.quantity 
+            : (shares > 0 ? lastDividendAmount / shares : 0);
+          
+          // Assume quarterly if we can't determine
+          dividendFrequency = 4;
+          annualDividendPerShare = lastDividendPerShare * 4;
+          annualDividendTotal = annualDividendPerShare * shares;
+          monthlyDividendPerShare = annualDividendPerShare / 12;
+          monthlyDividendTotal = annualDividendTotal / 12;
+        }
+      } else if (dividends.length === 1) {
+        // Only one dividend ever - assume quarterly
+        const lastDividendAmount = Math.abs(lastDividend.netAmount);
+        const lastDividendPerShare = lastDividend.quantity > 0 
+          ? lastDividendAmount / lastDividend.quantity 
+          : (shares > 0 ? lastDividendAmount / shares : 0);
+        
+        dividendFrequency = 4;
+        annualDividendPerShare = lastDividendPerShare * 4;
+        annualDividendTotal = annualDividendPerShare * shares;
+        monthlyDividendPerShare = annualDividendPerShare / 12;
+        monthlyDividendTotal = annualDividendTotal / 12;
+      }
       
-      const annualDividend = recentDividends.reduce((sum, div) => 
-        sum + Math.abs(div.netAmount), 0
-      );
+      // Calculate yield metrics using projected annual dividend per share
+      const yieldOnCost = avgCost > 0 ? (annualDividendPerShare / avgCost) * 100 : 0;
       
-      const monthlyDividend = annualDividend / 12;
-      const yieldOnCost = totalCost > 0 ? (annualDividend / totalCost) * 100 : 0;
+      // Dividend return percent is based on actual total received
       const dividendReturnPercent = totalCost > 0 ? (totalReceived / totalCost) * 100 : 0;
-      const dividendAdjustedCost = totalCost - totalReceived;
+      
+      // Dividend adjusted cost per share
+      const dividendAdjustedCostPerShare = shares > 0 ? avgCost - (totalReceived / shares) : avgCost;
+      const dividendAdjustedCost = dividendAdjustedCostPerShare * shares;
+      
+      logger.info(`Dividend metrics for ${symbol}: frequency=${dividendFrequency}, monthlyPerShare=$${monthlyDividendPerShare.toFixed(4)}, annualPerShare=$${annualDividendPerShare.toFixed(4)}`);
       
       return {
         totalReceived,
@@ -293,8 +379,12 @@ class DataSyncService {
         dividendReturnPercent,
         yieldOnCost,
         dividendAdjustedCost,
-        monthlyDividend,
-        annualDividend
+        dividendAdjustedCostPerShare,
+        monthlyDividend: monthlyDividendTotal,  // Total for all shares
+        monthlyDividendPerShare,  // Per share - NEW
+        annualDividend: annualDividendTotal,    // Total for all shares
+        annualDividendPerShare,   // Per share - NEW
+        dividendFrequency
       };
     } catch (error) {
       logger.error(`Error calculating dividend metrics for ${symbol}:`, error);
@@ -305,8 +395,12 @@ class DataSyncService {
         dividendReturnPercent: 0,
         yieldOnCost: 0,
         dividendAdjustedCost: 0,
+        dividendAdjustedCostPerShare: 0,
         monthlyDividend: 0,
-        annualDividend: 0
+        monthlyDividendPerShare: 0,
+        annualDividend: 0,
+        annualDividendPerShare: 0,
+        dividendFrequency: 0
       };
     }
   }
