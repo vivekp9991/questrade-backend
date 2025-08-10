@@ -1,4 +1,4 @@
-// services/tokenManager.js - FIXED VERSION
+// services/tokenManager.js - FIXED VERSION with correct Questrade API call
 const Token = require('../models/Token');
 const Person = require('../models/Person');
 const logger = require('../utils/logger');
@@ -38,7 +38,7 @@ class TokenManager {
     }
   }
 
-  // Refresh access token for a specific person
+  // Refresh access token for a specific person - FIXED
   async refreshAccessToken(personName) {
     try {
       const refreshTokenDoc = await Token.findOne({
@@ -60,15 +60,13 @@ class TokenManager {
       
       logger.info(`Attempting to refresh access token for ${personName}...`);
       
-      const response = await axios.post(`${this.authUrl}/oauth2/token`, null, {
+      // FIXED: Use GET request with query parameters as per Questrade API documentation
+      const response = await axios.get(`${this.authUrl}/oauth2/token`, {
         params: {
           grant_type: 'refresh_token',
           refresh_token: refreshToken
         },
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded'
-        },
-        timeout: 10000 // 10 second timeout
+        timeout: 15000 // 15 second timeout
       });
 
       const { access_token, refresh_token: newRefreshToken, api_server, expires_in } = response.data;
@@ -145,7 +143,7 @@ class TokenManager {
     }
   }
 
-  // Add or update refresh token for a person
+  // Add or update refresh token for a person - FIXED
   async setupPersonToken(personName, refreshToken) {
     try {
       // Validate refresh token format
@@ -158,14 +156,11 @@ class TokenManager {
       
       logger.info(`Setting up token for ${personName}...`);
       
-      // Validate the refresh token by trying to get an access token
-      const testResponse = await axios.post(`${this.authUrl}/oauth2/token`, null, {
+      // FIXED: Validate the refresh token by trying to get an access token using GET request
+      const testResponse = await axios.get(`${this.authUrl}/oauth2/token`, {
         params: {
           grant_type: 'refresh_token',
           refresh_token: cleanToken
-        },
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded'
         },
         timeout: 15000 // 15 second timeout for initial validation
       });
@@ -291,12 +286,12 @@ class TokenManager {
     }
   }
 
-  // Test connection for a person
+  // Test connection for a person - FIXED
   async testConnection(personName) {
     try {
       const { accessToken, apiServer } = await this.getValidAccessToken(personName);
       
-      const response = await axios.get(`${apiServer}v1/time`, {
+      const response = await axios.get(`${apiServer}/v1/time`, {
         headers: {
           'Authorization': `Bearer ${accessToken}`
         },
@@ -407,14 +402,11 @@ class TokenManager {
         };
       }
 
-      // Test with Questrade API
-      const response = await axios.post(`${this.authUrl}/oauth2/token`, null, {
+      // FIXED: Test with Questrade API using GET request
+      const response = await axios.get(`${this.authUrl}/oauth2/token`, {
         params: {
           grant_type: 'refresh_token',
           refresh_token: cleanToken
-        },
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded'
         },
         timeout: 15000 // 15 second timeout
       });
