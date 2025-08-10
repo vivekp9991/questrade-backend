@@ -1,4 +1,4 @@
-// services/dataSync.js - FIXED VERSION
+// services/dataSync.js - ENHANCED VERSION - 6 Months Activities with Pagination
 const questradeApi = require('./questradeApi');
 const Account = require('../models/Account');
 const Position = require('../models/Position');
@@ -12,6 +12,189 @@ const logger = require('../utils/logger');
 class DataSyncService {
   constructor() {
     this.syncInProgress = new Map(); // Track sync status per person
+    
+    // Questrade API limits and pagination settings
+    this.QUESTRADE_LIMITS = {
+      MAX_DAYS_PER_REQUEST: 31,        // Questrade limit: max 31 days per request
+      MAX_ACTIVITIES_PER_REQUEST: 1000, // Estimated limit per request
+      REQUEST_DELAY_MS: 100,           // Delay between requests to avoid rate limiting
+      MAX_RETRIES: 3                   // Max retries for failed requests
+    };
+  }
+
+  /**
+   * Format date for Questrade API - FIXED VERSION
+   * Questrade requires ISO 8601 format with timezone: YYYY-MM-DDTHH:mm:ss-05:00
+   */
+  formatDateForQuestrade(date) {
+    const d = new Date(date);
+    
+    // Get date components
+    const year = d.getFullYear();
+    const month = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    
+    // For activities, Questrade expects date-only format with Eastern timezone
+    // Format: YYYY-MM-DDTHH:mm:ss-05:00 (Eastern Time)
+    return `${year}-${month}-${day}T00:00:00-05:00`;
+  }
+
+  /**
+   * Split date range into chunks that respect Questrade's 31-day limit
+   */
+  splitDateRangeIntoChunks(startDate, endDate, maxDaysPerChunk = 31) {
+    const chunks = [];
+    let currentStart = new Date(startDate);
+    const finalEnd = new Date(endDate);
+
+    while (currentStart <= finalEnd) {
+      let currentEnd = new Date(currentStart);
+      currentEnd.setDate(currentEnd.getDate() + maxDaysPerChunk - 1);
+      
+      // Don't exceed the final end date
+      if (currentEnd > finalEnd) {
+        currentEnd = new Date(finalEnd);
+      }
+
+      chunks.push({
+        startDate: new Date(currentStart),
+        endDate: new Date(currentEnd),
+        startFormatted: this.formatDateForQuestrade(currentStart),
+        endFormatted: this.formatDateForQuestrade(currentEnd)
+      });
+
+      // Move to next chunk
+      currentStart = new Date(currentEnd);
+      currentStart.setDate(currentStart.getDate() + 1);
+    }
+
+    return chunks;
+  }
+
+  /**
+   * Fetch activities with pagination and chunking
+   */
+  async fetchActivitiesWithPagination(accountId, personName, startDate, endDate, maxRetries = 3) {
+    const allActivities = [];
+    let totalFetched = 0;
+    let totalErrors = 0;
+
+    // Split the date range into manageable chunks
+    const dateChunks = this.splitDateRangeIntoChunks(
+      startDate, 
+      endDate, 
+      this.QUESTRADE_LIMITS.MAX_DAYS_PER_REQUEST
+    );
+
+    logger.info(`Fetching activities for account ${accountId} in ${dateChunks.length} date chunks`, {
+      service: "questrade-portfolio",
+      personName,
+      accountId,
+      dateRange: `${this.formatDateForQuestrade(startDate)} to ${this.formatDateForQuestrade(endDate)}`,
+      chunks: dateChunks.length,
+      timestamp: new Date().toISOString()
+    });
+
+    for (let i = 0; i < dateChunks.length; i++) {
+      const chunk = dateChunks[i];
+      let retryCount = 0;
+      let chunkSuccess = false;
+
+      while (retryCount < maxRetries && !chunkSuccess) {
+        try {
+          logger.info(`Fetching chunk ${i + 1}/${dateChunks.length} for account ${accountId}: ${chunk.startFormatted} to ${chunk.endFormatted}`, {
+            service: "questrade-portfolio",
+            personName,
+            accountId,
+            chunkIndex: i + 1,
+            totalChunks: dateChunks.length,
+            retryCount: retryCount + 1,
+            timestamp: new Date().toISOString()
+          });
+
+          const activitiesData = await questradeApi.getAccountActivities(
+            accountId,
+            personName,
+            chunk.startFormatted,
+            chunk.endFormatted
+          );
+
+          if (activitiesData && activitiesData.activities) {
+            const chunkActivities = activitiesData.activities;
+            allActivities.push(...chunkActivities);
+            totalFetched += chunkActivities.length;
+
+            logger.info(`Retrieved ${chunkActivities.length} activities from chunk ${i + 1}/${dateChunks.length}`, {
+              service: "questrade-portfolio",
+              personName,
+              accountId,
+              chunkActivities: chunkActivities.length,
+              totalSoFar: totalFetched,
+              timestamp: new Date().toISOString()
+            });
+
+            chunkSuccess = true;
+
+            // Add delay between requests to avoid rate limiting
+            if (i < dateChunks.length - 1) {
+              await new Promise(resolve => setTimeout(resolve, this.QUESTRADE_LIMITS.REQUEST_DELAY_MS));
+            }
+          } else {
+            logger.warn(`No activities data received for chunk ${i + 1}/${dateChunks.length}`, {
+              service: "questrade-portfolio",
+              personName,
+              accountId,
+              timestamp: new Date().toISOString()
+            });
+            chunkSuccess = true; // Consider empty response as success
+          }
+
+        } catch (error) {
+          retryCount++;
+          totalErrors++;
+
+          logger.error(`Error fetching chunk ${i + 1}/${dateChunks.length}, attempt ${retryCount}/${maxRetries}:`, {
+            service: "questrade-portfolio",
+            personName,
+            accountId,
+            error: error.message,
+            chunkIndex: i + 1,
+            retryCount,
+            timestamp: new Date().toISOString()
+          });
+
+          if (retryCount >= maxRetries) {
+            logger.error(`Failed to fetch chunk ${i + 1}/${dateChunks.length} after ${maxRetries} attempts`, {
+              service: "questrade-portfolio",
+              personName,
+              accountId,
+              error: error.message,
+              timestamp: new Date().toISOString()
+            });
+            
+            // Continue with next chunk instead of failing completely
+            break;
+          } else {
+            // Exponential backoff for retries
+            const delayMs = Math.pow(2, retryCount) * 1000;
+            logger.info(`Retrying chunk ${i + 1} in ${delayMs}ms...`);
+            await new Promise(resolve => setTimeout(resolve, delayMs));
+          }
+        }
+      }
+    }
+
+    logger.info(`Completed activities fetch for account ${accountId}: ${totalFetched} activities in ${dateChunks.length} chunks with ${totalErrors} errors`, {
+      service: "questrade-portfolio",
+      personName,
+      accountId,
+      totalActivities: totalFetched,
+      totalChunks: dateChunks.length,
+      totalErrors,
+      timestamp: new Date().toISOString()
+    });
+
+    return allActivities;
   }
 
   /**
@@ -19,7 +202,7 @@ class DataSyncService {
    */
   async syncPersonData(personName, options = {}) {
     const { fullSync = false, forceRefresh = false } = options;
-    console.log("personName ::- " + personName);
+    
     if (this.syncInProgress.get(personName)) {
       throw new Error(`Sync already in progress for ${personName}`);
     }
@@ -27,17 +210,20 @@ class DataSyncService {
     this.syncInProgress.set(personName, true);
     
     try {
-      logger.info(`Starting sync for person: ${personName}`);
+      logger.info(`Starting sync for person: ${personName}`, {
+        service: "questrade-portfolio",
+        timestamp: new Date().toISOString()
+      });
       
-      // Verify person exists and has valid token - FIXED
-      const person = await Person.findOne({ personName }); // Changed from name to personName
+      // Verify person exists and has valid token
+      const person = await Person.findOne({ personName });
       if (!person) {
         throw new Error(`Person ${personName} not found`);
       }
 
-      const token = await Token.findOne({ personName });
+      const token = await Token.findOne({ personName, type: 'refresh', isActive: true });
       if (!token) {
-        throw new Error(`No token found for person ${personName}`);
+        throw new Error(`No active refresh token found for person ${personName}`);
       }
 
       const syncResults = {
@@ -46,28 +232,68 @@ class DataSyncService {
         accounts: { synced: 0, errors: [] },
         positions: { synced: 0, errors: [] },
         activities: { synced: 0, errors: [] },
-        snapshots: { created: false, error: null }
+        snapshots: { created: false, error: null },
+        service: "questrade-portfolio"
       };
 
       // Sync accounts first
+      logger.info(`Syncing accounts for ${personName}...`, {
+        service: "questrade-portfolio",
+        timestamp: new Date().toISOString()
+      });
+      
       const accountsResult = await this.syncAccountsForPerson(personName, fullSync);
       syncResults.accounts = accountsResult;
+      
+      logger.info(`Account sync completed for ${personName}: ${accountsResult.synced} synced, ${accountsResult.errors.length} errors`, {
+        service: "questrade-portfolio",
+        timestamp: new Date().toISOString()
+      });
 
       // If accounts sync was successful, sync positions and activities
-      if (accountsResult.synced > 0 || !accountsResult.errors.length) {
+      if (accountsResult.synced > 0 || accountsResult.errors.length === 0) {
+        logger.info(`Syncing positions for ${personName}...`, {
+          service: "questrade-portfolio",
+          timestamp: new Date().toISOString()
+        });
+        
         const positionsResult = await this.syncPositionsForPerson(personName, fullSync);
         syncResults.positions = positionsResult;
+        
+        logger.info(`Position sync completed for ${personName}: ${positionsResult.synced} synced, ${positionsResult.errors.length} errors`, {
+          service: "questrade-portfolio",
+          timestamp: new Date().toISOString()
+        });
 
-        if (fullSync) {
-          const activitiesResult = await this.syncActivitiesForPerson(personName, fullSync);
-          syncResults.activities = activitiesResult;
-        }
+        // Sync activities (with enhanced 6-month pagination)
+        logger.info(`Syncing activities for ${personName}...`, {
+          service: "questrade-portfolio",
+          timestamp: new Date().toISOString()
+        });
+        
+        const activitiesResult = await this.syncActivitiesForPerson(personName, fullSync);
+        syncResults.activities = activitiesResult;
+        
+        logger.info(`Activity sync completed for ${personName}: ${activitiesResult.synced} synced, ${activitiesResult.errors.length} errors`, {
+          service: "questrade-portfolio",
+          timestamp: new Date().toISOString()
+        });
 
         // Create portfolio snapshot if requested
         if (fullSync || forceRefresh) {
           try {
-            await this.createPortfolioSnapshot(personName);
+            logger.info(`Creating portfolio snapshot for ${personName}...`, {
+              service: "questrade-portfolio",
+              timestamp: new Date().toISOString()
+            });
+            
+            const snapshot = await this.createPortfolioSnapshot(personName);
             syncResults.snapshots.created = true;
+            
+            logger.info(`Created portfolio snapshot for ${personName}: $${snapshot.currentValue.toFixed(2)}`, {
+              service: "questrade-portfolio",
+              timestamp: new Date().toISOString()
+            });
           } catch (snapshotError) {
             syncResults.snapshots.error = snapshotError.message;
             logger.error(`Snapshot creation failed for ${personName}:`, snapshotError);
@@ -75,28 +301,34 @@ class DataSyncService {
         }
       }
 
-      // Update person's last sync time - FIXED
+      // Update person's last sync time
       await Person.findOneAndUpdate(
-        { personName }, // Changed from name to personName
+        { personName },
         { 
           lastSyncTime: new Date(),
           lastSyncStatus: 'success',
-          lastSyncResults: syncResults
+          lastSyncResults: syncResults,
+          lastSyncError: null
         }
       );
 
       syncResults.endTime = new Date();
       syncResults.duration = syncResults.endTime - syncResults.startTime;
       
-      logger.info(`Sync completed for person: ${personName}`, syncResults);
+      logger.info(`Sync completed for person: ${personName}`, {
+        ...syncResults,
+        service: "questrade-portfolio",
+        timestamp: new Date().toISOString()
+      });
+      
       return syncResults;
 
     } catch (error) {
       logger.error(`Sync failed for person: ${personName}`, error);
       
-      // Update person's sync status - FIXED
+      // Update person's sync status
       await Person.findOneAndUpdate(
-        { personName }, // Changed from name to personName
+        { personName },
         { 
           lastSyncTime: new Date(),
           lastSyncStatus: 'failed',
@@ -121,11 +353,11 @@ class DataSyncService {
 
     for (const person of persons) {
       try {
-        const result = await this.syncPersonData(person.personName, { fullSync }); // Changed from name
+        const result = await this.syncPersonData(person.personName, { fullSync });
         allResults.push(result);
       } catch (error) {
         const errorResult = {
-          personName: person.personName, // Changed from name
+          personName: person.personName,
           error: error.message,
           success: false
         };
@@ -147,14 +379,16 @@ class DataSyncService {
     const result = { synced: 0, errors: [] };
     
     try {
-      logger.info(`Syncing accounts for ${personName}...`);
       const accountsData = await questradeApi.getAccounts(personName);
       
       if (!accountsData || !accountsData.accounts) {
         throw new Error('No accounts data received from API');
       }
 
-      logger.info(`Found ${accountsData.accounts.length} accounts for ${personName}`);
+      logger.info(`Found ${accountsData.accounts.length} accounts for ${personName}`, {
+        service: "questrade-portfolio",
+        timestamp: new Date().toISOString()
+      });
       
       for (const accountData of accountsData.accounts) {
         try {
@@ -177,7 +411,6 @@ class DataSyncService {
           );
 
           result.synced++;
-          logger.debug(`Synced account ${accountData.number} for ${personName}`);
         } catch (accountError) {
           result.errors.push({
             accountId: accountData.number,
@@ -187,7 +420,6 @@ class DataSyncService {
         }
       }
 
-      logger.info(`Account sync completed for ${personName}: ${result.synced} synced, ${result.errors.length} errors`);
     } catch (error) {
       result.errors.push({
         type: 'API_ERROR',
@@ -207,7 +439,6 @@ class DataSyncService {
     const result = { synced: 0, errors: [] };
     
     try {
-      logger.info(`Syncing positions for ${personName}...`);
       const accounts = await Account.find({ personName });
       
       if (accounts.length === 0) {
@@ -220,17 +451,22 @@ class DataSyncService {
           const positionsData = await questradeApi.getAccountPositions(account.accountId, personName);
           
           if (!positionsData || !positionsData.positions) {
-            logger.warn(`No positions data for account ${account.accountId}`);
+            logger.info(`Processing 0 positions for account ${account.accountId}`, {
+              service: "questrade-portfolio",
+              timestamp: new Date().toISOString()
+            });
             continue;
           }
 
           // Clear existing positions for this account if full sync
           if (fullSync) {
             await Position.deleteMany({ accountId: account.accountId, personName });
-            logger.debug(`Cleared existing positions for account ${account.accountId}`);
           }
 
-          logger.info(`Processing ${positionsData.positions.length} positions for account ${account.accountId}`);
+          logger.info(`Processing ${positionsData.positions.length} positions for account ${account.accountId}`, {
+            service: "questrade-portfolio",
+            timestamp: new Date().toISOString()
+          });
 
           for (const positionData of positionsData.positions) {
             try {
@@ -305,7 +541,6 @@ class DataSyncService {
             }
           }
           
-          logger.debug(`Synced ${positionsData.positions.length} positions for account ${account.accountId}`);
         } catch (accountError) {
           result.errors.push({
             accountId: account.accountId,
@@ -315,7 +550,6 @@ class DataSyncService {
         }
       }
 
-      logger.info(`Position sync completed for ${personName}: ${result.synced} synced, ${result.errors.length} errors`);
     } catch (error) {
       result.errors.push({
         type: 'POSITIONS_SYNC_ERROR',
@@ -329,15 +563,14 @@ class DataSyncService {
   }
 
   /**
-   * Sync activities for a specific person
+   * Sync activities for a specific person - ENHANCED WITH 6-MONTH PAGINATION
    */
   async syncActivitiesForPerson(personName, fullSync = false) {
     const result = { synced: 0, errors: [] };
     
     try {
-      logger.info(`Syncing activities for ${personName}...`);
       const accounts = await Account.find({ personName });
-      console.log("dataSync :--> " + accounts);
+      
       if (accounts.length === 0) {
         logger.warn(`No accounts found for ${personName}, skipping activity sync`);
         return result;
@@ -345,33 +578,52 @@ class DataSyncService {
       
       for (const account of accounts) {
         try {
-          // Get activities for the last 30 days or longer if fullSync
+          // ENHANCED: Calculate date range - 6 months for full sync, 1 month for incremental
           const endDate = new Date();
           const startDate = new Date();
+          
           if (fullSync) {
-            startDate.setFullYear(startDate.getFullYear() - 1); // Last year for full sync
+            startDate.setMonth(startDate.getMonth() - 6); // Last 6 months for full sync
           } else {
-            startDate.setDate(startDate.getDate() - 30); // Last 30 days for incremental
+            startDate.setMonth(startDate.getMonth() - 1); // Last 1 month for incremental
           }
           
-          // Format dates for Questrade API
-          const formatDate = (date) => date.toISOString().split('T')[0];
-          
-          const activitiesData = await questradeApi.getAccountActivities(
+          logger.info(`Syncing ${fullSync ? '6 months' : '1 month'} of activities for account ${account.accountId}`, {
+            service: "questrade-portfolio",
+            personName,
+            accountId: account.accountId,
+            startDate: startDate.toISOString().split('T')[0],
+            endDate: endDate.toISOString().split('T')[0],
+            fullSync,
+            timestamp: new Date().toISOString()
+          });
+
+          // ENHANCED: Use pagination-enabled fetch
+          const allActivities = await this.fetchActivitiesWithPagination(
             account.accountId,
             personName,
-            formatDate(startDate),
-            formatDate(endDate)
+            startDate,
+            endDate
           );
 
-          if (!activitiesData || !activitiesData.activities) {
-            logger.warn(`No activities data for account ${account.accountId}`);
+          if (allActivities.length === 0) {
+            logger.info(`No activities found for account ${account.accountId} in the specified date range`, {
+              service: "questrade-portfolio",
+              timestamp: new Date().toISOString()
+            });
             continue;
           }
 
-          logger.info(`Processing ${activitiesData.activities.length} activities for account ${account.accountId}`);
+          logger.info(`Processing ${allActivities.length} activities for account ${account.accountId}`, {
+            service: "questrade-portfolio",
+            timestamp: new Date().toISOString()
+          });
 
-          for (const activityData of activitiesData.activities) {
+          // Process activities with deduplication
+          let newActivitiesCount = 0;
+          let duplicateActivitiesCount = 0;
+
+          for (const activityData of allActivities) {
             try {
               // Determine activity type
               let activityType = 'Other';
@@ -421,21 +673,23 @@ class DataSyncService {
                 createdAt: new Date()
               };
 
-              // Create unique identifier for the activity
-              const activityId = `${account.accountId}_${activityData.transactionDate}_${activityData.symbol || 'CASH'}_${activityData.netAmount}_${activityData.type}`;
-
+              // Enhanced deduplication - check if activity already exists
               const existingActivity = await Activity.findOne({
                 personName,
                 accountId: account.accountId,
                 transactionDate: activityData.transactionDate,
                 symbol: activityData.symbol || null,
                 netAmount: activityData.netAmount,
-                type: activityType
+                type: activityType,
+                description: activityData.description // Add description to make matching more precise
               });
 
               if (!existingActivity) {
                 await Activity.create(activityDoc);
+                newActivitiesCount++;
                 result.synced++;
+              } else {
+                duplicateActivitiesCount++;
               }
             } catch (activityError) {
               result.errors.push({
@@ -446,18 +700,36 @@ class DataSyncService {
               logger.error(`Failed to save activity:`, activityError);
             }
           }
+
+          logger.info(`Activity processing completed for account ${account.accountId}: ${newActivitiesCount} new, ${duplicateActivitiesCount} duplicates`, {
+            service: "questrade-portfolio",
+            personName,
+            accountId: account.accountId,
+            newActivities: newActivitiesCount,
+            duplicates: duplicateActivitiesCount,
+            totalProcessed: allActivities.length,
+            timestamp: new Date().toISOString()
+          });
           
-          logger.debug(`Synced activities for account ${account.accountId}`);
         } catch (accountError) {
+          // IMPROVED ERROR HANDLING: Log specific error details
+          const errorMessage = accountError.message || 'Unknown error';
+          
+          logger.error(`Failed to sync activities for account ${account.accountId}: ${errorMessage}`, {
+            service: "questrade-portfolio",
+            personName,
+            accountId: account.accountId,
+            stack: accountError.stack,
+            timestamp: new Date().toISOString()
+          });
+          
           result.errors.push({
             accountId: account.accountId,
-            error: accountError.message
+            error: errorMessage
           });
-          logger.error(`Failed to sync activities for account ${account.accountId}:`, accountError);
         }
       }
 
-      logger.info(`Activity sync completed for ${personName}: ${result.synced} synced, ${result.errors.length} errors`);
     } catch (error) {
       result.errors.push({
         type: 'ACTIVITIES_SYNC_ERROR',
@@ -475,7 +747,6 @@ class DataSyncService {
    */
   async createPortfolioSnapshot(personName) {
     try {
-      logger.info(`Creating portfolio snapshot for ${personName}...`);
       const positions = await Position.find({ personName });
       const accounts = await Account.find({ personName });
       
@@ -508,7 +779,6 @@ class DataSyncService {
       });
 
       await snapshot.save();
-      logger.info(`Created portfolio snapshot for ${personName}: $${currentValue.toFixed(2)}`);
       
       return snapshot;
     } catch (error) {
@@ -518,10 +788,10 @@ class DataSyncService {
   }
 
   /**
-   * Get sync status for a person - FIXED
+   * Get sync status for a person
    */
   async getSyncStatus(personName) {
-    const person = await Person.findOne({ personName }); // Changed from name
+    const person = await Person.findOne({ personName });
     if (!person) {
       return null;
     }
@@ -546,14 +816,14 @@ class DataSyncService {
   }
 
   /**
-   * Get sync status for all persons - FIXED
+   * Get sync status for all persons
    */
   async getAllSyncStatuses() {
     const persons = await Person.find({});
     const statuses = [];
 
     for (const person of persons) {
-      const status = await this.getSyncStatus(person.personName); // Changed from name
+      const status = await this.getSyncStatus(person.personName);
       statuses.push(status);
     }
 
@@ -561,7 +831,7 @@ class DataSyncService {
   }
 
   /**
-   * Force stop sync for a person (emergency stop) - FIXED
+   * Force stop sync for a person (emergency stop)
    */
   async stopSync(personName) {
     this.syncInProgress.set(personName, false);
@@ -569,12 +839,207 @@ class DataSyncService {
     
     // Update person status
     await Person.findOneAndUpdate(
-      { personName }, // Changed from name
+      { personName },
       { 
         lastSyncStatus: 'stopped',
         lastSyncError: 'Manually stopped'
       }
     );
+  }
+
+  /**
+   * Get activity statistics for a person
+   */
+  async getActivityStatistics(personName) {
+    try {
+      const activities = await Activity.aggregate([
+        { $match: { personName } },
+        {
+          $group: {
+            _id: '$type',
+            count: { $sum: 1 },
+            totalAmount: { $sum: '$netAmount' },
+            avgAmount: { $avg: '$netAmount' },
+            earliestDate: { $min: '$transactionDate' },
+            latestDate: { $max: '$transactionDate' }
+          }
+        },
+        { $sort: { count: -1 } }
+      ]);
+
+      const totalActivities = await Activity.countDocuments({ personName });
+      const dividendActivities = await Activity.countDocuments({ 
+        personName, 
+        type: 'Dividend' 
+      });
+
+      // Get date range of activities
+      const dateRange = await Activity.aggregate([
+        { $match: { personName } },
+        {
+          $group: {
+            _id: null,
+            earliestDate: { $min: '$transactionDate' },
+            latestDate: { $max: '$transactionDate' }
+          }
+        }
+      ]);
+
+      return {
+        personName,
+        totalActivities,
+        dividendActivities,
+        dateRange: dateRange[0] || null,
+        byType: activities,
+        lastUpdated: new Date()
+      };
+    } catch (error) {
+      logger.error(`Failed to get activity statistics for ${personName}:`, error);
+      throw error;
+    }
+  }
+
+  /**
+   * Bulk sync activities for multiple accounts with enhanced progress tracking
+   */
+  async bulkSyncActivities(personNames = null, options = {}) {
+    const { 
+      fullSync = true, 
+      maxConcurrent = 2,
+      progressCallback = null 
+    } = options;
+
+    let persons;
+    if (personNames) {
+      persons = await Person.find({ 
+        personName: { $in: personNames }, 
+        isActive: true 
+      });
+    } else {
+      persons = await Person.find({ isActive: true });
+    }
+
+    const results = [];
+    let completed = 0;
+
+    logger.info(`Starting bulk activities sync for ${persons.length} person(s)`, {
+      service: "questrade-portfolio",
+      personCount: persons.length,
+      fullSync,
+      maxConcurrent,
+      timestamp: new Date().toISOString()
+    });
+
+    // Process persons in batches to avoid overwhelming the API
+    for (let i = 0; i < persons.length; i += maxConcurrent) {
+      const batch = persons.slice(i, i + maxConcurrent);
+      
+      const batchPromises = batch.map(async (person) => {
+        try {
+          const startTime = Date.now();
+          const result = await this.syncActivitiesForPerson(person.personName, fullSync);
+          const duration = Date.now() - startTime;
+          
+          completed++;
+          
+          const personResult = {
+            personName: person.personName,
+            success: true,
+            duration,
+            ...result
+          };
+
+          if (progressCallback) {
+            progressCallback({
+              completed,
+              total: persons.length,
+              current: person.personName,
+              result: personResult
+            });
+          }
+
+          return personResult;
+        } catch (error) {
+          completed++;
+          
+          const errorResult = {
+            personName: person.personName,
+            success: false,
+            error: error.message,
+            duration: 0
+          };
+
+          if (progressCallback) {
+            progressCallback({
+              completed,
+              total: persons.length,
+              current: person.personName,
+              result: errorResult
+            });
+          }
+
+          return errorResult;
+        }
+      });
+
+      const batchResults = await Promise.all(batchPromises);
+      results.push(...batchResults);
+
+      // Add delay between batches
+      if (i + maxConcurrent < persons.length) {
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      }
+    }
+
+    const summary = {
+      totalPersons: persons.length,
+      successful: results.filter(r => r.success).length,
+      failed: results.filter(r => !r.success).length,
+      totalActivitiesSynced: results
+        .filter(r => r.success)
+        .reduce((sum, r) => sum + (r.synced || 0), 0),
+      totalDuration: results.reduce((sum, r) => sum + r.duration, 0),
+      results
+    };
+
+    logger.info(`Bulk activities sync completed`, {
+      service: "questrade-portfolio",
+      summary,
+      timestamp: new Date().toISOString()
+    });
+
+    return summary;
+  }
+
+  /**
+   * Clean up old activities (optional maintenance function)
+   */
+  async cleanupOldActivities(personName, retentionMonths = 24) {
+    try {
+      const cutoffDate = new Date();
+      cutoffDate.setMonth(cutoffDate.getMonth() - retentionMonths);
+
+      const deleteResult = await Activity.deleteMany({
+        personName,
+        transactionDate: { $lt: cutoffDate }
+      });
+
+      logger.info(`Cleaned up old activities for ${personName}`, {
+        service: "questrade-portfolio",
+        personName,
+        deletedCount: deleteResult.deletedCount,
+        cutoffDate: cutoffDate.toISOString(),
+        timestamp: new Date().toISOString()
+      });
+
+      return {
+        deletedCount: deleteResult.deletedCount,
+        cutoffDate
+      };
+    } catch (error) {
+      logger.error(`Failed to cleanup old activities for ${personName}:`, error);
+      throw error;
+    }
   }
 }
 

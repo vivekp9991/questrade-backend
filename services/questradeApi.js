@@ -1,4 +1,4 @@
-// services/questradeApi.js - FIXED VERSION
+// services/questradeApi.js - FIXED VERSION - Corrected Activities Parameter Order
 const axios = require('axios');
 const tokenManager = require('./tokenManager');
 const logger = require('../utils/logger');
@@ -131,15 +131,35 @@ class QuestradeAPI {
     return this.makeRequest(`/accounts/${accountId}/balances`, personName);
   }
 
-  // FIXED: Corrected parameter order for getAccountActivities
+  // FIXED: Corrected parameter order and date handling for getAccountActivities
   async getAccountActivities(accountId, personName, startTime, endTime) {
-    const params = new URLSearchParams();
-    if (startTime) params.append('startTime', startTime);
-    if (endTime) params.append('endTime', endTime);
-    
-    const queryString = params.toString();
-    const endpoint = `/accounts/${accountId}/activities${queryString ? '?' + queryString : ''}`;
-    return this.makeRequest(endpoint, personName);
+    try {
+      // Validate required parameters
+      if (!accountId || !personName) {
+        throw new Error('accountId and personName are required for getAccountActivities');
+      }
+
+      // Build the query parameters
+      const params = new URLSearchParams();
+      
+      if (startTime) {
+        params.append('startTime', startTime);
+      }
+      
+      if (endTime) {
+        params.append('endTime', endTime);
+      }
+      
+      const queryString = params.toString();
+      const endpoint = `/accounts/${accountId}/activities${queryString ? '?' + queryString : ''}`;
+      
+      logger.debug(`Fetching activities for account ${accountId} (${personName}) with endpoint: ${endpoint}`);
+      
+      return this.makeRequest(endpoint, personName);
+    } catch (error) {
+      logger.error(`Error getting account activities for ${accountId} (${personName}):`, error);
+      throw error;
+    }
   }
 
   async getAccountOrders(accountId, personName, stateFilter = null) {
