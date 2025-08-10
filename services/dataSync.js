@@ -2,669 +2,426 @@
 const questradeApi = require('./questradeApi');
 const Account = require('../models/Account');
 const Position = require('../models/Position');
-const Symbol = require('../models/Symbol');
 const Activity = require('../models/Activity');
-const MarketQuote = require('../models/MarketQuote');
 const PortfolioSnapshot = require('../models/PortfolioSnapshot');
-const logger = require('../utils/logger');
+const Person = require('../models/Person');
+const Token = require('../models/Token');
+const logger = require('./logger');
 
 class DataSyncService {
-  // Sync all accounts
-  async syncAccounts() {
-    try {
-      const { accounts } = await questradeApi.getAccounts();
-      
-      for (const account of accounts) {
-        await Account.findOneAndUpdate(
-          { accountId: account.number },
-          {
-            accountId: account.number,
-            type: account.type,
-            number: account.number,
-            status: account.status,
-            isPrimary: account.isPrimary,
-            isBilling: account.isBilling,
-            clientAccountType: account.clientAccountType,
-            syncedAt: new Date()
-          },
-          { upsert: true, new: true }
-        );
-        
-        // Sync balances for each account
-        await this.syncAccountBalances(account.number);
-      }
-      
-      logger.info(`Synced ${accounts.length} accounts`);
-      return accounts;
-    } catch (error) {
-      logger.error('Error syncing accounts:', error);
-      throw error;
-    }
+  constructor() {
+    this.syncInProgress = new Map(); // Track sync status per person
   }
 
-  // Sync account balances
-  async syncAccountBalances(accountId) {
+  /**
+   * Sync all data for a specific person
+   */
+  async syncPersonData(personName, options = {}) {
+    const { fullSync = false, forceRefresh = false } = options;
+    
+    if (this.syncInProgress.get(personName)) {
+      throw new Error(`Sync already in progress for ${personName}`);
+    }
+
+    this.syncInProgress.set(personName, true);
+    
     try {
-      const balances = await questradeApi.getAccountBalances(accountId);
+      logger.info(`Starting sync for person: ${personName}`);
       
-      await Account.findOneAndUpdate(
-        { accountId },
-        {
-          balances: {
-            ...balances,
-            lastUpdated: new Date()
-          },
-          updatedAt: new Date()
+      // Verify person exists and has valid token
+      const person = await Person.findOne({ name: personName });
+      if (!person) {
+        throw new Error(`Person ${personName} not found`);
+      }
+
+      const token = await Token.findOne({ personName });
+      if (!token) {
+        throw new Error(`No token found for person ${personName}`);
+      }
+
+      const syncResults = {
+        personName,
+        startTime: new Date(),
+        accounts: { synced: 0, errors: [] },
+        positions: { synced: 0, errors: [] },
+        activities: { synced: 0, errors: [] },
+        snapshots: { created: false, error: null }
+      };
+
+      // Sync accounts first
+      const accountsResult = await this.syncAccountsForPerson(personName, fullSync);
+      syncResults.accounts = accountsResult;
+
+      // If accounts sync was successful, sync positions and activities
+      if (accountsResult.synced > 0 || !accountsResult.errors.length) {
+        const positionsResult = await this.syncPositionsForPerson(personName, fullSync);
+        syncResults.positions = positionsResult;
+
+        const activitiesResult = await this.syncActivitiesForPerson(personName, fullSync);
+        syncResults.activities = activitiesResult;
+
+        // Create portfolio snapshot if requested
+        if (fullSync || forceRefresh) {
+          try {
+            await this.createPortfolioSnapshot(personName);
+            syncResults.snapshots.created = true;
+          } catch (snapshotError) {
+            syncResults.snapshots.error = snapshotError.message;
+            logger.error(`Snapshot creation failed for ${personName}:`, snapshotError);
+          }
+        }
+      }
+
+      // Update person's last sync time
+      await Person.findOneAndUpdate(
+        { name: personName },
+        { 
+          lastSyncTime: new Date(),
+          lastSyncStatus: 'success',
+          lastSyncResults: syncResults
         }
       );
+
+      syncResults.endTime = new Date();
+      syncResults.duration = syncResults.endTime - syncResults.startTime;
       
-      logger.info(`Synced balances for account ${accountId}`);
-      return balances;
+      logger.info(`Sync completed for person: ${personName}`, syncResults);
+      return syncResults;
+
     } catch (error) {
-      logger.error(`Error syncing balances for account ${accountId}:`, error);
+      logger.error(`Sync failed for person: ${personName}`, error);
+      
+      // Update person's sync status
+      await Person.findOneAndUpdate(
+        { name: personName },
+        { 
+          lastSyncTime: new Date(),
+          lastSyncStatus: 'failed',
+          lastSyncError: error.message
+        }
+      );
+
       throw error;
+    } finally {
+      this.syncInProgress.set(personName, false);
     }
   }
 
-  // Sync positions for an account
-  async syncPositions(accountId) {
+  /**
+   * Sync data for all persons
+   */
+  async syncAllPersons(options = {}) {
+    const { fullSync = false, continueOnError = true } = options;
+    
+    const persons = await Person.find({ isActive: true });
+    const allResults = [];
+
+    for (const person of persons) {
+      try {
+        const result = await this.syncPersonData(person.name, { fullSync });
+        allResults.push(result);
+      } catch (error) {
+        const errorResult = {
+          personName: person.name,
+          error: error.message,
+          success: false
+        };
+        allResults.push(errorResult);
+        
+        if (!continueOnError) {
+          throw error;
+        }
+      }
+    }
+
+    return allResults;
+  }
+
+  /**
+   * Sync accounts for a specific person
+   */
+  async syncAccountsForPerson(personName, fullSync = false) {
+    const result = { synced: 0, errors: [] };
+    
     try {
-      const { positions } = await questradeApi.getAccountPositions(accountId);
+      const accountsData = await questradeApi.getAccounts(personName);
       
-      // If no positions, return early
-      if (!positions || positions.length === 0) {
-        logger.info(`No positions found for account ${accountId}`);
-        return [];
-      }
-      
-      // Get symbol IDs for batch quote fetch
-      const symbolIds = positions.map(p => p.symbolId).filter(id => id != null);
-      
-      // Only fetch if we have symbol IDs
-      let symbolMap = {};
-      let quoteMap = {};
-      
-      if (symbolIds.length > 0) {
+      for (const accountData of accountsData.accounts) {
         try {
-          // Fetch symbols - using comma-separated string
-          const symbolsData = await questradeApi.getSymbols(symbolIds.join(','));
-          
-          if (symbolsData.symbols) {
-            symbolsData.symbols.forEach(sym => {
-              symbolMap[sym.symbolId] = sym;
-            });
-          }
-        } catch (error) {
-          logger.warn(`Could not fetch symbol data: ${error.message}`);
-        }
-        
-        // Try to fetch quotes - this might fail if market data access is not enabled
-        try {
-          const quotesData = await questradeApi.getMarketQuote(symbolIds);
-          
-          if (quotesData.quotes) {
-            quotesData.quotes.forEach(quote => {
-              quoteMap[quote.symbolId] = quote;
-            });
-          }
-        } catch (error) {
-          if (error.message.includes('OAuth scopes')) {
-            logger.warn('Market data access not enabled. Enable it in your Questrade app settings.');
-            logger.warn('Continuing without real-time quotes...');
-          } else {
-            logger.warn(`Could not fetch quote data: ${error.message}`);
-          }
-        }
-      }
-      
-      // Process each position
-      for (const position of positions) {
-        const symbolInfo = symbolMap[position.symbolId] || {};
-        const quote = quoteMap[position.symbolId] || {};
-        
-        // Calculate metrics
-        const totalReturnValue = position.openPnl || 0;
-        const totalReturnPercent = position.averageEntryPrice > 0 
-          ? ((position.currentPrice - position.averageEntryPrice) / position.averageEntryPrice) * 100 
-          : 0;
-        
-        // Get dividend data from activities
-        const dividendData = await this.calculateDividendMetrics(accountId, position.symbol);
-        
-        await Position.findOneAndUpdate(
-          { accountId, symbol: position.symbol },
-          {
-            accountId,
-            symbol: position.symbol,
-            symbolId: position.symbolId,
-            openQuantity: position.openQuantity,
-            closedQuantity: position.closedQuantity || 0,
-            currentMarketValue: position.currentMarketValue,
-            currentPrice: quote.lastTradePrice || position.currentPrice,
-            averageEntryPrice: position.averageEntryPrice,
-            dayPnl: position.dayPnl || 0,
-            closedPnl: position.closedPnl || 0,
-            openPnl: position.openPnl || 0,
-            totalCost: position.totalCost,
-            isRealTime: position.isRealTime,
-            isUnderReorg: position.isUnderReorg || false,
-            totalReturnPercent,
-            totalReturnValue,
-            capitalGainPercent: totalReturnPercent,
-            capitalGainValue: totalReturnValue,
-            dividendData,
-            marketData: {
-              lastPrice: quote.lastTradePrice || position.currentPrice,
-              bidPrice: quote.bidPrice,
-              askPrice: quote.askPrice,
-              volume: quote.volume,
-              dayHigh: quote.highPrice,
-              dayLow: quote.lowPrice,
-              fiftyTwoWeekHigh: symbolInfo.highPrice52,
-              fiftyTwoWeekLow: symbolInfo.lowPrice52,
-              lastUpdated: new Date()
-            },
-            syncedAt: new Date()
-          },
-          { upsert: true, new: true }
-        );
-        
-        // Update symbol information if we have it
-        if (symbolInfo.symbol) {
-          await Symbol.findOneAndUpdate(
-            { symbolId: position.symbolId },
-            {
-              symbol: symbolInfo.symbol,
-              symbolId: symbolInfo.symbolId,
-              description: symbolInfo.description,
-              securityType: symbolInfo.securityType,
-              listingExchange: symbolInfo.listingExchange,
-              currency: symbolInfo.currency,
-              isTradable: symbolInfo.isTradable,
-              isQuotable: symbolInfo.isQuotable,
-              prevDayClosePrice: symbolInfo.prevDayClosePrice,
-              highPrice52: symbolInfo.highPrice52,
-              lowPrice52: symbolInfo.lowPrice52,
-              averageVol3Months: symbolInfo.averageVol3Months,
-              averageVol20Days: symbolInfo.averageVol20Days,
-              outstandingShares: symbolInfo.outstandingShares,
-              marketCap: symbolInfo.marketCap,
-              dividend: symbolInfo.dividend,
-              dividendPerShare: symbolInfo.dividend,
-              yield: symbolInfo.yield,
-              exDate: symbolInfo.exDate,
-              dividendDate: symbolInfo.dividendDate,
-              industrySector: symbolInfo.industrySector,
-              industryGroup: symbolInfo.industryGroup,
-              industrySubGroup: symbolInfo.industrySubGroup,
-              minTicks: symbolInfo.minTicks,
-              eps: symbolInfo.eps,
-              pe: symbolInfo.pe,
-              hasOptions: symbolInfo.hasOptions,
-              lastUpdated: new Date()
-            },
+          const accountDoc = {
+            personName,
+            accountId: accountData.number,
+            type: accountData.type,
+            number: accountData.number,
+            status: accountData.status,
+            isPrimary: accountData.isPrimary,
+            isBilling: accountData.isBilling,
+            clientAccountType: accountData.clientAccountType,
+            lastUpdated: new Date()
+          };
+
+          await Account.findOneAndUpdate(
+            { accountId: accountData.number, personName },
+            accountDoc,
             { upsert: true, new: true }
           );
-        }
-        
-        // Save market quote if available
-        if (quote.symbol) {
-          try {
-            await MarketQuote.create({
-              symbol: quote.symbol,
-              symbolId: quote.symbolId,
-              bidPrice: quote.bidPrice,
-              bidSize: quote.bidSize,
-              askPrice: quote.askPrice,
-              askSize: quote.askSize,
-              lastTradePrice: quote.lastTradePrice,
-              lastTradeSize: quote.lastTradeSize,
-              lastTradeTick: quote.lastTradeTick,
-              lastTradeTime: quote.lastTradeTime,
-              volume: quote.volume,
-              openPrice: quote.openPrice,
-              highPrice: quote.highPrice,
-              lowPrice: quote.lowPrice,
-              delay: quote.delay,
-              isHalted: quote.isHalted,
-              VWAP: quote.VWAP,
-              isSnapQuote: false,
-              snapQuoteTime: new Date()
-            });
-          } catch (error) {
-            logger.warn(`Could not save market quote: ${error.message}`);
-          }
+
+          result.synced++;
+          logger.debug(`Synced account ${accountData.number} for ${personName}`);
+        } catch (accountError) {
+          result.errors.push({
+            accountId: accountData.number,
+            error: accountError.message
+          });
+          logger.error(`Failed to sync account ${accountData.number}:`, accountError);
         }
       }
-      
-      logger.info(`Synced ${positions.length} positions for account ${accountId}`);
-      return positions;
     } catch (error) {
-      logger.error(`Error syncing positions for account ${accountId}:`, error);
+      result.errors.push({
+        type: 'API_ERROR',
+        error: error.message
+      });
       throw error;
     }
+
+    return result;
   }
 
-
-  // Calculate dividend metrics for a position
-  async calculateDividendMetrics(accountId, symbol) {
-    try {
-      const dividends = await Activity.find({
-        accountId,
-        symbol,
-        type: 'Dividend'
-      }).sort({ transactionDate: -1 });
-      
-      if (dividends.length === 0) {
-        return {
-          totalReceived: 0,
-          lastDividendAmount: 0,
-          lastDividendDate: null,
-          dividendReturnPercent: 0,
-          yieldOnCost: 0,
-          dividendAdjustedCost: 0,
-          dividendAdjustedCostPerShare: 0,
-          monthlyDividend: 0,
-          monthlyDividendPerShare: 0,
-          annualDividend: 0,
-          annualDividendPerShare: 0,
-          dividendFrequency: 0
-        };
-      }
-      
-      const totalReceived = dividends.reduce((sum, div) => sum + Math.abs(div.netAmount), 0);
-      const lastDividend = dividends[0];
-      
-      // Get position for cost basis and shares
-      const position = await Position.findOne({ accountId, symbol });
-      const totalCost = position ? position.totalCost : 0;
-      const shares = position ? position.openQuantity : 0;
-      const avgCost = shares > 0 ? totalCost / shares : 0;
-      
-      // Determine dividend frequency by analyzing payment patterns
-      let dividendFrequency = 0; // payments per year
-      let monthlyDividendTotal = 0;
-      let annualDividendTotal = 0;
-      let monthlyDividendPerShare = 0;
-      let annualDividendPerShare = 0;
-      
-      if (dividends.length >= 2) {
-        // Calculate average days between dividends for last year
-        const oneYearAgo = new Date();
-        oneYearAgo.setFullYear(oneYearAgo.getFullYear() - 1);
-        
-        const recentDividends = dividends.filter(d => 
-          new Date(d.transactionDate) > oneYearAgo
-        );
-        
-        if (recentDividends.length >= 2) {
-          // Calculate frequency based on payment patterns
-          const daysBetweenPayments = [];
-          for (let i = 0; i < recentDividends.length - 1; i++) {
-            const days = Math.abs(
-              (new Date(recentDividends[i].transactionDate) - new Date(recentDividends[i + 1].transactionDate)) 
-              / (1000 * 60 * 60 * 24)
-            );
-            daysBetweenPayments.push(days);
-          }
-          
-          const avgDaysBetween = daysBetweenPayments.reduce((a, b) => a + b, 0) / daysBetweenPayments.length;
-          
-          // Determine frequency based on average days between payments
-          if (avgDaysBetween <= 35) {
-            dividendFrequency = 12; // Monthly
-          } else if (avgDaysBetween <= 100) {
-            dividendFrequency = 4;  // Quarterly
-          } else if (avgDaysBetween <= 200) {
-            dividendFrequency = 2;  // Semi-annual
-          } else {
-            dividendFrequency = 1;  // Annual
-          }
-          
-          // Calculate based on most recent dividend and frequency
-          const lastDividendAmount = Math.abs(lastDividend.netAmount);
-          
-          // Get dividend per share from the last dividend
-          const lastDividendPerShare = lastDividend.quantity > 0 
-            ? lastDividendAmount / lastDividend.quantity 
-            : (shares > 0 ? lastDividendAmount / shares : 0);
-          
-          // Project annual amounts
-          annualDividendPerShare = lastDividendPerShare * dividendFrequency;
-          annualDividendTotal = annualDividendPerShare * shares;
-          
-          // Calculate monthly amounts
-          monthlyDividendPerShare = annualDividendPerShare / 12;
-          monthlyDividendTotal = annualDividendTotal / 12;
-          
-        } else {
-          // If we only have one recent dividend, estimate based on that
-          const lastDividendAmount = Math.abs(lastDividend.netAmount);
-          const lastDividendPerShare = lastDividend.quantity > 0 
-            ? lastDividendAmount / lastDividend.quantity 
-            : (shares > 0 ? lastDividendAmount / shares : 0);
-          
-          // Assume quarterly if we can't determine
-          dividendFrequency = 4;
-          annualDividendPerShare = lastDividendPerShare * 4;
-          annualDividendTotal = annualDividendPerShare * shares;
-          monthlyDividendPerShare = annualDividendPerShare / 12;
-          monthlyDividendTotal = annualDividendTotal / 12;
-        }
-      } else if (dividends.length === 1) {
-        // Only one dividend ever - assume quarterly
-        const lastDividendAmount = Math.abs(lastDividend.netAmount);
-        const lastDividendPerShare = lastDividend.quantity > 0 
-          ? lastDividendAmount / lastDividend.quantity 
-          : (shares > 0 ? lastDividendAmount / shares : 0);
-        
-        dividendFrequency = 4;
-        annualDividendPerShare = lastDividendPerShare * 4;
-        annualDividendTotal = annualDividendPerShare * shares;
-        monthlyDividendPerShare = annualDividendPerShare / 12;
-        monthlyDividendTotal = annualDividendTotal / 12;
-      }
-      
-      // Calculate yield metrics using projected annual dividend per share
-      const yieldOnCost = avgCost > 0 ? (annualDividendPerShare / avgCost) * 100 : 0;
-      
-      // Dividend return percent is based on actual total received
-      const dividendReturnPercent = totalCost > 0 ? (totalReceived / totalCost) * 100 : 0;
-      
-      // Dividend adjusted cost per share
-      const dividendAdjustedCostPerShare = shares > 0 ? avgCost - (totalReceived / shares) : avgCost;
-      const dividendAdjustedCost = dividendAdjustedCostPerShare * shares;
-      
-      logger.info(`Dividend metrics for ${symbol}: frequency=${dividendFrequency}, monthlyPerShare=$${monthlyDividendPerShare.toFixed(4)}, annualPerShare=$${annualDividendPerShare.toFixed(4)}`);
-      
-      return {
-        totalReceived,
-        lastDividendAmount: Math.abs(lastDividend.netAmount),
-        lastDividendDate: lastDividend.transactionDate,
-        dividendReturnPercent,
-        yieldOnCost,
-        dividendAdjustedCost,
-        dividendAdjustedCostPerShare,
-        monthlyDividend: monthlyDividendTotal,  // Total for all shares
-        monthlyDividendPerShare,  // Per share - NEW
-        annualDividend: annualDividendTotal,    // Total for all shares
-        annualDividendPerShare,   // Per share - NEW
-        dividendFrequency
-      };
-    } catch (error) {
-      logger.error(`Error calculating dividend metrics for ${symbol}:`, error);
-      return {
-        totalReceived: 0,
-        lastDividendAmount: 0,
-        lastDividendDate: null,
-        dividendReturnPercent: 0,
-        yieldOnCost: 0,
-        dividendAdjustedCost: 0,
-        dividendAdjustedCostPerShare: 0,
-        monthlyDividend: 0,
-        monthlyDividendPerShare: 0,
-        annualDividend: 0,
-        annualDividendPerShare: 0,
-        dividendFrequency: 0
-      };
-    }
-  }
-
-  // Format date for Questrade API (ISO format with timezone)
-  formatQuestradeDate(date) {
-    const d = new Date(date);
-    // Questrade expects ISO format with timezone like: 2011-02-01T00:00:00.000000-05:00
-    const year = d.getFullYear();
-    const month = String(d.getMonth() + 1).padStart(2, '0');
-    const day = String(d.getDate()).padStart(2, '0');
+  /**
+   * Sync positions for a specific person
+   */
+  async syncPositionsForPerson(personName, fullSync = false) {
+    const result = { synced: 0, errors: [] };
     
-    // Use Eastern Time zone offset (-05:00 for EST, -04:00 for EDT)
-    // For simplicity, we'll use -05:00 which Questrade accepts year-round
-    return `${year}-${month}-${day}T00:00:00-05:00`;
-  }
-
-  // Sync account activities (dividends, trades, etc.)
-  async syncActivities(accountId, startDate = null, endDate = null) {
     try {
-      // Default to last 30 days if no dates provided
-      if (!endDate) {
-        endDate = new Date();
-      }
-      if (!startDate) {
-        startDate = new Date();
-        startDate.setDate(startDate.getDate() - 30);
-      }
+      const accounts = await Account.find({ personName });
       
-      // Format dates for Questrade API
-      const formattedStartDate = this.formatQuestradeDate(startDate);
-      const formattedEndDate = this.formatQuestradeDate(endDate);
-      
-      logger.info(`Fetching activities from ${formattedStartDate} to ${formattedEndDate}`);
-      
-      const { activities } = await questradeApi.getAccountActivities(
-        accountId, 
-        formattedStartDate, 
-        formattedEndDate
-      );
-      
-      let newActivities = 0;
-      
-      for (const activity of activities) {
-        // Normalize activity type
-        let normalizedType = 'Other';
-        const rawType = activity.type || '';
-        
-        if (rawType.toLowerCase().includes('trade')) {
-          normalizedType = 'Trade';
-        } else if (rawType.toLowerCase().includes('dividend')) {
-          normalizedType = 'Dividend';
-        } else if (rawType.toLowerCase().includes('deposit')) {
-          normalizedType = 'Deposit';
-        } else if (rawType.toLowerCase().includes('withdrawal')) {
-          normalizedType = 'Withdrawal';
-        } else if (rawType.toLowerCase().includes('interest')) {
-          normalizedType = 'Interest';
-        } else if (rawType.toLowerCase().includes('transfer')) {
-          normalizedType = 'Transfer';
-        } else if (rawType.toLowerCase().includes('fee')) {
-          normalizedType = 'Fee';
-        } else if (rawType.toLowerCase().includes('tax')) {
-          normalizedType = 'Tax';
-        } else if (rawType.toLowerCase().includes('fx')) {
-          normalizedType = 'FX';
-        }
-        
-        // Check if activity already exists
-        const exists = await Activity.findOne({
-          accountId,
-          transactionDate: activity.transactionDate,
-          symbol: activity.symbol,
-          type: normalizedType,
-          netAmount: activity.netAmount
-        });
-        
-        if (!exists) {
-          await Activity.create({
-            accountId,
-            tradeDate: activity.tradeDate,
-            transactionDate: activity.transactionDate,
-            settlementDate: activity.settlementDate,
-            action: activity.action,
-            symbol: activity.symbol,
-            symbolId: activity.symbolId,
-            description: activity.description,
-            currency: activity.currency,
-            quantity: activity.quantity,
-            price: activity.price,
-            grossAmount: activity.grossAmount,
-            commission: activity.commission,
-            netAmount: activity.netAmount,
-            type: normalizedType,
-            rawType: rawType,
-            isDividend: normalizedType === 'Dividend',
-            dividendPerShare: normalizedType === 'Dividend' && activity.quantity > 0 
-              ? Math.abs(activity.netAmount) / activity.quantity 
-              : 0
-          });
-          newActivities++;
-        }
-      }
-      
-      logger.info(`Synced ${activities.length} activities for account ${accountId} (${newActivities} new)`);
-      return activities;
-    } catch (error) {
-      logger.error(`Error syncing activities for account ${accountId}:`, error);
-      // Don't throw - activities are not critical for basic functionality
-      return [];
-    }
-  }
-
-  // Create portfolio snapshot
-  async createPortfolioSnapshot(accountId = null) {
-    try {
-      const query = accountId ? { accountId } : {};
-      const positions = await Position.find(query);
-      const accounts = await Account.find(query);
-      
-      if (positions.length === 0) {
-        logger.info(`No positions to snapshot for account ${accountId || 'all'}`);
-        return null;
-      }
-      
-      // Calculate totals
-      let totalInvestment = 0;
-      let currentValue = 0;
-      let unrealizedPnl = 0;
-      let totalDividends = 0;
-      let monthlyDividendIncome = 0;
-      let annualProjectedDividend = 0;
-      
-      const sectorMap = {};
-      const currencyMap = {};
-      
-      for (const position of positions) {
-        totalInvestment += position.totalCost || 0;
-        currentValue += position.currentMarketValue || 0;
-        unrealizedPnl += position.openPnl || 0;
-        
-        if (position.dividendData) {
-          totalDividends += position.dividendData.totalReceived || 0;
-          monthlyDividendIncome += position.dividendData.monthlyDividend || 0;
-          annualProjectedDividend += position.dividendData.annualDividend || 0;
-        }
-        
-        // Get symbol info for sector allocation
-        const symbol = await Symbol.findOne({ symbolId: position.symbolId });
-        if (symbol) {
-          const sector = symbol.securityType || 'Other';
-          sectorMap[sector] = (sectorMap[sector] || 0) + position.currentMarketValue;
+      for (const account of accounts) {
+        try {
+          const positionsData = await questradeApi.getPositions(account.accountId, personName);
           
-          const currency = symbol.currency || 'CAD';
-          currencyMap[currency] = (currencyMap[currency] || 0) + position.currentMarketValue;
+          // Clear existing positions for this account if full sync
+          if (fullSync) {
+            await Position.deleteMany({ accountId: account.accountId, personName });
+          }
+
+          for (const positionData of positionsData.positions) {
+            const positionDoc = {
+              personName,
+              accountId: account.accountId,
+              symbolId: positionData.symbolId,
+              symbol: positionData.symbol,
+              openQuantity: positionData.openQuantity,
+              currentMarketValue: positionData.currentMarketValue,
+              currentPrice: positionData.currentPrice,
+              averageEntryPrice: positionData.averageEntryPrice,
+              closedPnl: positionData.closedPnl,
+              openPnl: positionData.openPnl,
+              totalCost: positionData.totalCost,
+              isRealTime: positionData.isRealTime,
+              isUnderReorg: positionData.isUnderReorg,
+              lastUpdated: new Date()
+            };
+
+            await Position.findOneAndUpdate(
+              { 
+                accountId: account.accountId,
+                symbolId: positionData.symbolId,
+                personName 
+              },
+              positionDoc,
+              { upsert: true, new: true }
+            );
+
+            result.synced++;
+          }
+          
+          logger.debug(`Synced ${positionsData.positions.length} positions for account ${account.accountId}`);
+        } catch (accountError) {
+          result.errors.push({
+            accountId: account.accountId,
+            error: accountError.message
+          });
         }
       }
-      
-      const totalReturnValue = unrealizedPnl + totalDividends;
-      const totalReturnPercent = totalInvestment > 0 
-        ? (totalReturnValue / totalInvestment) * 100 
-        : 0;
-      
-      const averageYieldPercent = currentValue > 0 
-        ? (annualProjectedDividend / currentValue) * 100 
-        : 0;
-      
-      const yieldOnCostPercent = totalInvestment > 0 
-        ? (annualProjectedDividend / totalInvestment) * 100 
-        : 0;
-      
-      // Format allocations
-      const sectorAllocation = Object.entries(sectorMap).map(([sector, value]) => ({
-        sector,
-        value,
-        percentage: (value / currentValue) * 100
-      }));
-      
-      const currencyBreakdown = Object.entries(currencyMap).map(([currency, value]) => ({
-        currency,
-        value,
-        percentage: (value / currentValue) * 100
-      }));
-      
-      const snapshot = await PortfolioSnapshot.create({
-        accountId,
-        date: new Date(),
-        totalInvestment,
-        currentValue,
-        totalReturnValue,
-        totalReturnPercent,
-        unrealizedPnl,
-        realizedPnl: 0, // TODO: Calculate from closed positions
-        totalDividends,
-        monthlyDividendIncome,
-        annualProjectedDividend,
-        averageYieldPercent,
-        yieldOnCostPercent,
-        numberOfPositions: positions.length,
-        numberOfDividendStocks: positions.filter(p => 
-          p.dividendData && p.dividendData.annualDividend > 0
-        ).length,
-        sectorAllocation,
-        currencyBreakdown,
-        assetAllocation: [] // TODO: Implement asset class allocation
+    } catch (error) {
+      result.errors.push({
+        type: 'POSITIONS_SYNC_ERROR',
+        error: error.message
       });
+      throw error;
+    }
+
+    return result;
+  }
+
+  /**
+   * Sync activities for a specific person
+   */
+  async syncActivitiesForPerson(personName, fullSync = false) {
+    const result = { synced: 0, errors: [] };
+    
+    try {
+      const accounts = await Account.find({ personName });
       
-      logger.info(`Created portfolio snapshot for account ${accountId || 'all'}`);
+      for (const account of accounts) {
+        try {
+          // Get activities for the last 30 days or all if fullSync
+          const startTime = fullSync ? 
+            new Date('2020-01-01') : 
+            new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+          
+          const activitiesData = await questradeApi.getActivities(
+            account.accountId, 
+            startTime.toISOString().split('T')[0],
+            new Date().toISOString().split('T')[0],
+            personName
+          );
+
+          for (const activityData of activitiesData.activities) {
+            const activityDoc = {
+              personName,
+              accountId: account.accountId,
+              activityId: `${account.accountId}_${activityData.tradeDate}_${activityData.transactionDate}_${activityData.settlementDate}_${activityData.symbol || 'CASH'}`,
+              tradeDate: activityData.tradeDate,
+              transactionDate: activityData.transactionDate,
+              settlementDate: activityData.settlementDate,
+              action: activityData.action,
+              symbol: activityData.symbol,
+              symbolId: activityData.symbolId,
+              description: activityData.description,
+              currency: activityData.currency,
+              quantity: activityData.quantity,
+              price: activityData.price,
+              grossAmount: activityData.grossAmount,
+              commission: activityData.commission,
+              netAmount: activityData.netAmount,
+              type: activityData.type,
+              lastUpdated: new Date()
+            };
+
+            await Activity.findOneAndUpdate(
+              { activityId: activityDoc.activityId, personName },
+              activityDoc,
+              { upsert: true, new: true }
+            );
+
+            result.synced++;
+          }
+          
+          logger.debug(`Synced ${activitiesData.activities.length} activities for account ${account.accountId}`);
+        } catch (accountError) {
+          result.errors.push({
+            accountId: account.accountId,
+            error: accountError.message
+          });
+        }
+      }
+    } catch (error) {
+      result.errors.push({
+        type: 'ACTIVITIES_SYNC_ERROR',
+        error: error.message
+      });
+      throw error;
+    }
+
+    return result;
+  }
+
+  /**
+   * Create portfolio snapshot for a person
+   */
+  async createPortfolioSnapshot(personName) {
+    try {
+      const positions = await Position.find({ personName });
+      const accounts = await Account.find({ personName });
+      
+      const totalValue = positions.reduce((sum, pos) => sum + (pos.currentMarketValue || 0), 0);
+      const totalPnL = positions.reduce((sum, pos) => sum + (pos.openPnl || 0), 0);
+      
+      const snapshot = new PortfolioSnapshot({
+        personName,
+        date: new Date(),
+        totalValue,
+        totalPnL,
+        positionCount: positions.length,
+        accountCount: accounts.length,
+        positions: positions.map(pos => ({
+          symbol: pos.symbol,
+          quantity: pos.openQuantity,
+          value: pos.currentMarketValue,
+          pnl: pos.openPnl
+        }))
+      });
+
+      await snapshot.save();
+      logger.info(`Created portfolio snapshot for ${personName}: $${totalValue.toFixed(2)}`);
+      
       return snapshot;
     } catch (error) {
-      logger.error('Error creating portfolio snapshot:', error);
-      // Don't throw - snapshots are not critical
-      return null;
+      logger.error(`Failed to create portfolio snapshot for ${personName}:`, error);
+      throw error;
     }
   }
 
-  // Full sync for an account
-  async fullSync(accountId = null) {
-    try {
-      logger.info(`Starting full sync for account ${accountId || 'all'}`);
-      
-      // Sync accounts
-      const accounts = await this.syncAccounts();
-      
-      // Sync data for each account
-      for (const account of accounts) {
-        const accId = account.number;
-        
-        // Skip if specific account requested and doesn't match
-        if (accountId && accountId !== accId) continue;
-        
-        // Sync positions (most important)
-        try {
-          await this.syncPositions(accId);
-        } catch (error) {
-          logger.error(`Failed to sync positions for ${accId}:`, error.message);
-        }
-        
-        // Sync activities (less critical)
-        try {
-          await this.syncActivities(accId);
-        } catch (error) {
-          logger.warn(`Failed to sync activities for ${accId}:`, error.message);
-        }
-        
-        // Create snapshot after sync
-        try {
-          await this.createPortfolioSnapshot(accId);
-        } catch (error) {
-          logger.warn(`Failed to create snapshot for ${accId}:`, error.message);
-        }
-      }
-      
-      logger.info(`Full sync completed for account ${accountId || 'all'}`);
-      return { success: true, accountsSynced: accounts.length };
-    } catch (error) {
-      logger.error('Error during full sync:', error);
-      throw error;
+  /**
+   * Get sync status for a person
+   */
+  async getSyncStatus(personName) {
+    const person = await Person.findOne({ name: personName });
+    if (!person) {
+      return null;
     }
+
+    const accountCount = await Account.countDocuments({ personName });
+    const positionCount = await Position.countDocuments({ personName });
+    const activityCount = await Activity.countDocuments({ personName });
+
+    return {
+      personName,
+      lastSyncTime: person.lastSyncTime,
+      lastSyncStatus: person.lastSyncStatus,
+      lastSyncError: person.lastSyncError,
+      lastSyncResults: person.lastSyncResults,
+      isInProgress: this.syncInProgress.get(personName) || false,
+      counts: {
+        accounts: accountCount,
+        positions: positionCount,
+        activities: activityCount
+      }
+    };
+  }
+
+  /**
+   * Get sync status for all persons
+   */
+  async getAllSyncStatuses() {
+    const persons = await Person.find({});
+    const statuses = [];
+
+    for (const person of persons) {
+      const status = await this.getSyncStatus(person.name);
+      statuses.push(status);
+    }
+
+    return statuses;
+  }
+
+  /**
+   * Force stop sync for a person (emergency stop)
+   */
+  async stopSync(personName) {
+    this.syncInProgress.set(personName, false);
+    logger.warn(`Force stopped sync for person: ${personName}`);
+    
+    // Update person status
+    await Person.findOneAndUpdate(
+      { name: personName },
+      { 
+        lastSyncStatus: 'stopped',
+        lastSyncError: 'Manually stopped'
+      }
+    );
   }
 }
 

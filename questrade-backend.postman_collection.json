@@ -1,33 +1,138 @@
 {
   "info": {
-    "name": "questrade-backend API",
+    "name": "Multi-Person Portfolio Manager API",
     "_postman_id": "b12d6ea7-5e6b-4b95-842a-2d148b894a79",
-    "description": "Collection covering all endpoints for questrade-backend",
+    "description": "Complete collection for multi-person portfolio management backend with Questrade integration",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "variable": [
-    { "key": "base_url", "value": "http://localhost:4000" }
+    { "key": "base_url", "value": "http://localhost:4000" },
+    { "key": "person_name", "value": "Vicky" },
+    { "key": "account_id", "value": "53413547" }
   ],
   "item": [
     {
-      "name": "Authentication",
+      "name": "Person Management",
       "item": [
         {
-          "name": "Get token status",
+          "name": "Create new person",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"personName\": \"Vicky\",\n  \"refreshToken\": \"your_refresh_token_here\"\n}"
+            },
+            "url": "{{base_url}}/api/persons"
+          }
+        },
+        {
+          "name": "Get all persons",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/persons"
+          }
+        },
+        {
+          "name": "Get specific person",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/persons/{{person_name}}"
+          }
+        },
+        {
+          "name": "Update person",
+          "request": {
+            "method": "PUT",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"newPersonName\": \"Victoria\"\n}"
+            },
+            "url": "{{base_url}}/api/persons/{{person_name}}"
+          }
+        },
+        {
+          "name": "Delete person",
+          "request": {
+            "method": "DELETE",
+            "url": "{{base_url}}/api/persons/{{person_name}}"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Authentication & Token Management",
+      "item": [
+        {
+          "name": "Setup person token",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"personName\": \"{{person_name}}\",\n  \"refreshToken\": \"your_refresh_token_here\"\n}"
+            },
+            "url": "{{base_url}}/api/auth/setup-person"
+          }
+        },
+        {
+          "name": "Refresh token for person",
+          "request": {
+            "method": "PUT",
+            "url": "{{base_url}}/api/auth/refresh-token/{{person_name}}"
+          }
+        },
+        {
+          "name": "Get token status for person",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/auth/token-status/{{person_name}}"
+          }
+        },
+        {
+          "name": "Get token status for all persons",
           "request": {
             "method": "GET",
             "url": "{{base_url}}/api/auth/token-status"
           }
         },
         {
-          "name": "Refresh token",
+          "name": "Test connection for person",
+          "request": {
+            "method": "POST",
+            "url": "{{base_url}}/api/auth/test-connection/{{person_name}}"
+          }
+        },
+        {
+          "name": "Delete token for person",
+          "request": {
+            "method": "DELETE",
+            "url": "{{base_url}}/api/auth/token/{{person_name}}"
+          }
+        },
+        {
+          "name": "Get token status (legacy)",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/auth/token-status"
+          }
+        },
+        {
+          "name": "Refresh token (legacy)",
           "request": {
             "method": "POST",
             "url": "{{base_url}}/api/auth/refresh-token"
           }
         },
         {
-          "name": "Update refresh token",
+          "name": "Update refresh token (legacy)",
           "request": {
             "method": "POST",
             "header": [
@@ -46,14 +151,28 @@
       "name": "Accounts",
       "item": [
         {
-          "name": "Get all accounts",
+          "name": "Get accounts by person",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/accounts/by-person"
+          }
+        },
+        {
+          "name": "Get dropdown options",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/accounts/dropdown-options"
+          }
+        },
+        {
+          "name": "Get all accounts (legacy)",
           "request": {
             "method": "GET",
             "url": "{{base_url}}/api/accounts"
           }
         },
         {
-          "name": "Create new account",
+          "name": "Create new account (legacy)",
           "request": {
             "method": "POST",
             "header": [
@@ -69,48 +188,107 @@
       ]
     },
     {
-      "name": "Portfolio",
+      "name": "Portfolio - All Accounts",
       "item": [
         {
           "name": "Portfolio summary (all accounts)",
           "request": {
             "method": "GET",
-            "url": "{{base_url}}/api/portfolio/summary"
+            "url": "{{base_url}}/api/portfolio/summary?viewMode=all&aggregate=true"
           }
         },
         {
-          "name": "Portfolio summary (TFSA account)",
+          "name": "Get all positions (aggregated)",
           "request": {
             "method": "GET",
-            "url": "{{base_url}}/api/portfolio/summary?accountId=53413547"
+            "url": "{{base_url}}/api/portfolio/positions?viewMode=all&aggregate=true"
           }
         },
         {
-          "name": "Portfolio summary (FHSA account)",
+          "name": "Dividend calendar (all accounts)",
           "request": {
             "method": "GET",
-            "url": "{{base_url}}/api/portfolio/summary?accountId=53510361"
+            "url": "{{base_url}}/api/portfolio/dividends/calendar?viewMode=all"
           }
         },
         {
-          "name": "Portfolio summary (Cash account)",
+          "name": "Portfolio snapshots (all accounts)",
           "request": {
             "method": "GET",
-            "url": "{{base_url}}/api/portfolio/summary?accountId=40058790"
+            "url": "{{base_url}}/api/portfolio/snapshots?viewMode=all&limit=10"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Portfolio - Person Specific",
+      "item": [
+        {
+          "name": "Portfolio summary (person)",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/portfolio/summary?viewMode=person&personName={{person_name}}&aggregate=true"
           }
         },
         {
-          "name": "Get all positions",
+          "name": "Get positions for person (aggregated)",
           "request": {
             "method": "GET",
-            "url": "{{base_url}}/api/portfolio/positions"
+            "url": "{{base_url}}/api/portfolio/positions?viewMode=person&personName={{person_name}}&aggregate=true"
+          }
+        },
+        {
+          "name": "Get positions for person (individual)",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/portfolio/positions?viewMode=person&personName={{person_name}}&aggregate=false"
+          }
+        },
+        {
+          "name": "Dividend calendar (person)",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/portfolio/dividends/calendar?viewMode=person&personName={{person_name}}"
+          }
+        },
+        {
+          "name": "Portfolio snapshots (person)",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/portfolio/snapshots?viewMode=person&personName={{person_name}}&limit=5"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Portfolio - Account Specific",
+      "item": [
+        {
+          "name": "Portfolio summary (specific account)",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/portfolio/summary?viewMode=account&accountId={{account_id}}"
           }
         },
         {
           "name": "Get positions for account",
           "request": {
             "method": "GET",
-            "url": "{{base_url}}/api/portfolio/positions?accountId=53413547"
+            "url": "{{base_url}}/api/portfolio/positions?viewMode=account&accountId={{account_id}}"
+          }
+        },
+        {
+          "name": "Dividend calendar (specific account)",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/portfolio/dividends/calendar?viewMode=account&accountId={{account_id}}"
+          }
+        },
+        {
+          "name": "Portfolio snapshots (account)",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/portfolio/snapshots?viewMode=account&accountId={{account_id}}&limit=5"
           }
         },
         {
@@ -124,53 +302,30 @@
           "name": "Get position details by symbol and account",
           "request": {
             "method": "GET",
-            "url": "{{base_url}}/api/portfolio/positions/GLD?accountId=53413547"
+            "url": "{{base_url}}/api/portfolio/positions/GLD?accountId={{account_id}}"
           }
-        },
+        }
+      ]
+    },
+    {
+      "name": "Data Synchronization",
+      "item": [
         {
-          "name": "Dividend calendar (all accounts)",
+          "name": "Sync person data",
           "request": {
-            "method": "GET",
-            "url": "{{base_url}}/api/portfolio/dividends/calendar"
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"fullSync\": true\n}"
+            },
+            "url": "{{base_url}}/api/sync/person/{{person_name}}"
           }
         },
         {
-          "name": "Dividend calendar (specific account)",
-          "request": {
-            "method": "GET",
-            "url": "{{base_url}}/api/portfolio/dividends/calendar?accountId=53413547"
-          }
-        },
-        {
-          "name": "Dividend calendar (date range)",
-          "request": {
-            "method": "GET",
-            "url": "{{base_url}}/api/portfolio/dividends/calendar?startDate=2025-07-01&endDate=2025-08-31"
-          }
-        },
-        {
-          "name": "Portfolio snapshots (limit)",
-          "request": {
-            "method": "GET",
-            "url": "{{base_url}}/api/portfolio/snapshots?limit=10"
-          }
-        },
-        {
-          "name": "Portfolio snapshots (account and limit)",
-          "request": {
-            "method": "GET",
-            "url": "{{base_url}}/api/portfolio/snapshots?accountId=53413547&limit=5"
-          }
-        },
-        {
-          "name": "Portfolio snapshots (date range)",
-          "request": {
-            "method": "GET",
-            "url": "{{base_url}}/api/portfolio/snapshots?startDate=2025-08-01&endDate=2025-08-07"
-          }
-        },
-        {
-          "name": "Sync portfolio data",
+          "name": "Sync all persons",
           "request": {
             "method": "POST",
             "header": [
@@ -180,7 +335,150 @@
               "mode": "raw",
               "raw": "{\n  \"fullSync\": false\n}"
             },
+            "url": "{{base_url}}/api/sync/all-persons"
+          }
+        },
+        {
+          "name": "Get sync status",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/sync/status"
+          }
+        },
+        {
+          "name": "Get sync status for person",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/sync/status/{{person_name}}"
+          }
+        },
+        {
+          "name": "Sync portfolio data (legacy)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"fullSync\": false,\n  \"personName\": \"{{person_name}}\"\n}"
+            },
             "url": "{{base_url}}/api/portfolio/sync"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Settings & Administration",
+      "item": [
+        {
+          "name": "Get settings dashboard",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/settings/dashboard"
+          }
+        },
+        {
+          "name": "Validate token",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"refreshToken\": \"your_refresh_token_to_validate\"\n}"
+            },
+            "url": "{{base_url}}/api/settings/validate-token"
+          }
+        },
+        {
+          "name": "Get error logs",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/settings/error-logs?personName={{person_name}}&days=7"
+          }
+        },
+        {
+          "name": "Clear errors for person",
+          "request": {
+            "method": "POST",
+            "url": "{{base_url}}/api/settings/clear-errors/{{person_name}}"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Health & Monitoring",
+      "item": [
+        {
+          "name": "System health overview",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/health/system"
+          }
+        },
+        {
+          "name": "Token health check",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/health/tokens"
+          }
+        },
+        {
+          "name": "Connection health check",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/health/connections"
+          }
+        },
+        {
+          "name": "Database health check",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/health/database"
+          }
+        },
+        {
+          "name": "Sync status health",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/health/sync-status"
+          }
+        },
+        {
+          "name": "Repair person issues",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"repairType\": \"all\"\n}"
+            },
+            "url": "{{base_url}}/api/health/repair/{{person_name}}"
+          }
+        },
+        {
+          "name": "Repair token issues only",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"repairType\": \"token\"\n}"
+            },
+            "url": "{{base_url}}/api/health/repair/{{person_name}}"
+          }
+        },
+        {
+          "name": "Server health check (legacy)",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/health"
           }
         }
       ]
@@ -226,14 +524,174 @@
       ]
     },
     {
-      "name": "Health",
+      "name": "Legacy Endpoints",
       "item": [
         {
-          "name": "Server health check",
+          "name": "Portfolio summary (legacy - all accounts)",
           "request": {
             "method": "GET",
-            "url": "{{base_url}}/health"
+            "url": "{{base_url}}/api/portfolio/summary"
           }
+        },
+        {
+          "name": "Portfolio summary (legacy - TFSA account)",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/portfolio/summary?accountId=53413547"
+          }
+        },
+        {
+          "name": "Portfolio summary (legacy - FHSA account)",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/portfolio/summary?accountId=53510361"
+          }
+        },
+        {
+          "name": "Portfolio summary (legacy - Cash account)",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/portfolio/summary?accountId=40058790"
+          }
+        },
+        {
+          "name": "Get all positions (legacy)",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/portfolio/positions"
+          }
+        },
+        {
+          "name": "Dividend calendar (legacy - date range)",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/portfolio/dividends/calendar?startDate=2025-07-01&endDate=2025-08-31"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Testing Scenarios",
+      "item": [
+        {
+          "name": "Test Multi-Person Setup",
+          "item": [
+            {
+              "name": "1. Create Person A",
+              "request": {
+                "method": "POST",
+                "header": [
+                  { "key": "Content-Type", "value": "application/json" }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"personName\": \"Vicky\",\n  \"refreshToken\": \"vicky_refresh_token_here\"\n}"
+                },
+                "url": "{{base_url}}/api/persons"
+              }
+            },
+            {
+              "name": "2. Create Person B",
+              "request": {
+                "method": "POST",
+                "header": [
+                  { "key": "Content-Type", "value": "application/json" }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"personName\": \"DV\",\n  \"refreshToken\": \"dv_refresh_token_here\"\n}"
+                },
+                "url": "{{base_url}}/api/persons"
+              }
+            },
+            {
+              "name": "3. Sync Both Persons",
+              "request": {
+                "method": "POST",
+                "header": [
+                  { "key": "Content-Type", "value": "application/json" }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"fullSync\": true\n}"
+                },
+                "url": "{{base_url}}/api/sync/all-persons"
+              }
+            },
+            {
+              "name": "4. Get Aggregated Portfolio",
+              "request": {
+                "method": "GET",
+                "url": "{{base_url}}/api/portfolio/summary?viewMode=all&aggregate=true"
+              }
+            }
+          ]
+        },
+        {
+          "name": "Test Account Selection",
+          "item": [
+            {
+              "name": "1. Get Dropdown Options",
+              "request": {
+                "method": "GET",
+                "url": "{{base_url}}/api/accounts/dropdown-options"
+              }
+            },
+            {
+              "name": "2. View All Accounts - Vicky",
+              "request": {
+                "method": "GET",
+                "url": "{{base_url}}/api/portfolio/summary?viewMode=person&personName=Vicky&aggregate=true"
+              }
+            },
+            {
+              "name": "3. View Individual Account",
+              "request": {
+                "method": "GET",
+                "url": "{{base_url}}/api/portfolio/summary?viewMode=account&accountId={{account_id}}"
+              }
+            },
+            {
+              "name": "4. Compare Aggregated vs Individual",
+              "request": {
+                "method": "GET",
+                "url": "{{base_url}}/api/portfolio/positions?viewMode=person&personName=Vicky&aggregate=false"
+              }
+            }
+          ]
+        },
+        {
+          "name": "Test Error Handling",
+          "item": [
+            {
+              "name": "1. Invalid Person Name",
+              "request": {
+                "method": "GET",
+                "url": "{{base_url}}/api/persons/InvalidPerson"
+              }
+            },
+            {
+              "name": "2. Invalid Token",
+              "request": {
+                "method": "POST",
+                "header": [
+                  { "key": "Content-Type", "value": "application/json" }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"refreshToken\": \"invalid_token_123\"\n}"
+                },
+                "url": "{{base_url}}/api/settings/validate-token"
+              }
+            },
+            {
+              "name": "3. Missing Required Parameters",
+              "request": {
+                "method": "GET",
+                "url": "{{base_url}}/api/portfolio/summary?viewMode=person"
+              }
+            }
+          ]
         }
       ]
     }

@@ -2,6 +2,7 @@
 const express = require('express');
 const router = express.Router();
 const portfolioCalculator = require('../services/portfolioCalculator');
+const accountAggregator = require('../services/accountAggregator');
 const dataSync = require('../services/dataSync');
 const Position = require('../models/Position');
 const Account = require('../models/Account');
@@ -9,15 +10,22 @@ const Symbol = require('../models/Symbol');
 const Activity = require('../models/Activity');
 const PortfolioSnapshot = require('../models/PortfolioSnapshot');
 const logger = require('../utils/logger');
+const { asyncHandler } = require('../middleware/errorHandler');
 
-// Get portfolio summary
-router.get('/summary', async (req, res) => {
+// Get portfolio summary with aggregation support
+router.get('/summary', asyncHandler(async (req, res) => {
+  const { viewMode = 'account', personName, accountId, aggregate = 'false' } = req.query;
+  
   try {
-    const { accountId } = req.query;
-      // Avoid logging entire request/response objects as they contain circular references
-    // which cause JSON.stringify to throw and break the endpoint. Log only the data we need.
-    // logger.info('Fetching portfolio summary', { accountId });
-    const summary = await portfolioCalculator.getPortfolioSummary(accountId);
+    let summary;
+    
+    if (aggregate === 'true' || viewMode !== 'account') {
+      // Use aggregation service
+      summary = await accountAggregator.getAggregatedSummary(viewMode, personName, accountId);
+    } else {
+      // Use legacy calculator for single account
+      summary = await portfolioCalculator.getPortfolioSummary(accountId);
+    }
     
     res.json({
       success: true,
@@ -30,35 +38,51 @@ router.get('/summary', async (req, res) => {
       error: 'Failed to get portfolio summary'
     });
   }
-});
+}));
 
-// Get positions
-router.get('/positions', async (req, res) => {
+// Get positions with aggregation support
+router.get('/positions', asyncHandler(async (req, res) => {
+  const { viewMode = 'account', personName, accountId, aggregate = 'false' } = req.query;
+  
   try {
-    const { accountId } = req.query;
-    const query = accountId ? { accountId } : {};
+    let positions;
     
-    const positions = await Position.find(query)
-      .sort({ currentMarketValue: -1 })
-      .lean();
+    if (aggregate === 'true' || viewMode !== 'account') {
+      // Use aggregation service
+      positions = await accountAggregator.aggregatePositions(viewMode, personName, accountId);
+    } else {
+      // Legacy single account query
+      const query = accountId ? { accountId } : {};
+      
+      positions = await Position.find(query)
+        .sort({ currentMarketValue: -1 })
+        .lean();
 
-    const symbolIds = positions.map(p => p.symbolId);
-    const symbols = await Symbol.find({ symbolId: { $in: symbolIds } }).lean();
-    const symbolMap = {};
-    symbols.forEach(sym => { symbolMap[sym.symbolId] = sym; });
+      // Enrich with symbol data
+      const symbolIds = positions.map(p => p.symbolId);
+      const symbols = await Symbol.find({ symbolId: { $in: symbolIds } }).lean();
+      const symbolMap = {};
+      symbols.forEach(sym => { symbolMap[sym.symbolId] = sym; });
 
-    const enrichedPositions = positions.map(p => ({
-      ...p,
-      dividendPerShare: symbolMap[p.symbolId]?.dividendPerShare ?? symbolMap[p.symbolId]?.dividend,
-      industrySector: symbolMap[p.symbolId]?.industrySector,
-      industryGroup: symbolMap[p.symbolId]?.industryGroup,
-      industrySubGroup: symbolMap[p.symbolId]?.industrySubGroup
-    }));
+      positions = positions.map(p => ({
+        ...p,
+        dividendPerShare: symbolMap[p.symbolId]?.dividendPerShare ?? symbolMap[p.symbolId]?.dividend,
+        industrySector: symbolMap[p.symbolId]?.industrySector,
+        industryGroup: symbolMap[p.symbolId]?.industryGroup,
+        industrySubGroup: symbolMap[p.symbolId]?.industrySubGroup
+      }));
+    }
 
-    
     res.json({
       success: true,
-      data: enrichedPositions
+      data: positions,
+      meta: {
+        viewMode,
+        personName,
+        accountId,
+        aggregated: aggregate === 'true' || viewMode !== 'account',
+        count: positions.length
+      }
     });
   } catch (error) {
     logger.error('Error getting positions:', error);
@@ -67,35 +91,57 @@ router.get('/positions', async (req, res) => {
       error: 'Failed to get positions'
     });
   }
-});
+}));
 
 // Get single position details
-router.get('/positions/:symbol', async (req, res) => {
+router.get('/positions/:symbol', asyncHandler(async (req, res) => {
+  const { symbol } = req.params;
+  const { viewMode = 'account', personName, accountId } = req.query;
+  
   try {
-    const { symbol } = req.params;
-    const { accountId } = req.query;
+    let query = { symbol };
     
-    const query = { symbol };
-    if (accountId) query.accountId = accountId;
+    // Build query based on view mode
+    switch (viewMode) {
+      case 'all':
+        // No additional filters
+        break;
+      case 'person':
+        if (personName) query.personName = personName;
+        break;
+      case 'account':
+        if (accountId) query.accountId = accountId;
+        break;
+    }
     
-    const position = await Position.findOne(query);
+    const positions = await Position.find(query).lean();
     
-    if (!position) {
+    if (positions.length === 0) {
       return res.status(404).json({
         success: false,
         error: 'Position not found'
       });
     }
-
-    const symbolInfo = await Symbol.findOne({ symbolId: position.symbolId }).lean();
+    
+    // If multiple positions for same symbol, aggregate them
+    let result;
+    if (positions.length === 1) {
+      result = positions[0];
+    } else {
+      // Use aggregation service for multiple positions
+      const aggregated = await accountAggregator.aggregateSymbolPositions(symbol, positions);
+      result = aggregated;
+    }
+    
+    // Enrich with symbol information
+    const symbolInfo = await Symbol.findOne({ symbolId: result.symbolId }).lean();
     const enrichedPosition = {
-      ...position,
+      ...result,
       dividendPerShare: symbolInfo?.dividendPerShare ?? symbolInfo?.dividend,
       industrySector: symbolInfo?.industrySector,
       industryGroup: symbolInfo?.industryGroup,
       industrySubGroup: symbolInfo?.industrySubGroup
     };
-
     
     res.json({
       success: true,
@@ -108,15 +154,32 @@ router.get('/positions/:symbol', async (req, res) => {
       error: 'Failed to get position'
     });
   }
-});
+}));
 
-// Get dividend calendar
-router.get('/dividends/calendar', async (req, res) => {
+// Get dividend calendar with person filtering
+router.get('/dividends/calendar', asyncHandler(async (req, res) => {
+  const { personName, viewMode, accountId, startDate, endDate } = req.query;
+  
   try {
-    const { accountId, startDate, endDate } = req.query;
-    const query = { type: 'Dividend' };
+    let query = { type: 'Dividend' };
     
-    if (accountId) query.accountId = accountId;
+    // Apply filters based on view mode
+    switch (viewMode) {
+      case 'all':
+        // No additional filters
+        break;
+      case 'person':
+        if (personName) query.personName = personName;
+        break;
+      case 'account':
+        if (accountId) query.accountId = accountId;
+        break;
+      default:
+        // Backward compatibility
+        if (accountId) query.accountId = accountId;
+        if (personName) query.personName = personName;
+    }
+    
     if (startDate || endDate) {
       query.transactionDate = {};
       if (startDate) query.transactionDate.$gte = new Date(startDate);
@@ -138,15 +201,38 @@ router.get('/dividends/calendar', async (req, res) => {
       error: 'Failed to get dividend calendar'
     });
   }
-});
+}));
 
-// Get portfolio snapshots (historical data)
-router.get('/snapshots', async (req, res) => {
+// Get portfolio snapshots with person filtering
+router.get('/snapshots', asyncHandler(async (req, res) => {
+  const { personName, viewMode, accountId, startDate, endDate, limit = 30 } = req.query;
+  
   try {
-    const { accountId, startDate, endDate, limit = 30 } = req.query;
-    const query = {};
+    let query = {};
     
-    if (accountId) query.accountId = accountId;
+    // Apply filters based on view mode
+    switch (viewMode) {
+      case 'all':
+        query.viewMode = 'all';
+        break;
+      case 'person':
+        if (personName) {
+          query.personName = personName;
+          query.viewMode = 'person';
+        }
+        break;
+      case 'account':
+        if (accountId) {
+          query.accountId = accountId;
+          query.viewMode = 'account';
+        }
+        break;
+      default:
+        // Backward compatibility
+        if (accountId) query.accountId = accountId;
+        if (personName) query.personName = personName;
+    }
+    
     if (startDate || endDate) {
       query.date = {};
       if (startDate) query.date.$gte = new Date(startDate);
@@ -168,25 +254,47 @@ router.get('/snapshots', async (req, res) => {
       error: 'Failed to get snapshots'
     });
   }
-});
+}));
 
-// Sync portfolio data
-router.post('/sync', async (req, res) => {
+// Sync portfolio data with person support
+router.post('/sync', asyncHandler(async (req, res) => {
+  const { personName, viewMode, accountId, fullSync = false } = req.body;
+  
   try {
-    const { accountId, fullSync = false } = req.body;
-    
     let result;
-    if (fullSync) {
-      result = await dataSync.fullSync(accountId);
-    } else {
-      // Quick sync - just positions and recent activities
-      const accounts = await dataSync.syncAccounts();
-      for (const account of accounts) {
-        if (!accountId || accountId === account.number) {
-          await dataSync.syncPositions(account.number);
+    
+    if (personName) {
+      // Sync for specific person
+      if (fullSync) {
+        result = await dataSync.fullSyncForPerson(personName);
+      } else {
+        result = await dataSync.quickSyncForPerson(personName);
+      }
+    } else if (accountId) {
+      // Sync for specific account
+      if (fullSync) {
+        result = await dataSync.fullSync(accountId);
+      } else {
+        const accounts = await dataSync.syncAccounts();
+        const targetAccount = accounts.find(acc => acc.number === accountId);
+        if (targetAccount) {
+          await dataSync.syncPositions(accountId);
+          result = { success: true, accountsSynced: 1 };
+        } else {
+          throw new Error('Account not found');
         }
       }
-      result = { success: true, accountsSynced: accounts.length };
+    } else {
+      // Sync all data
+      if (fullSync) {
+        result = await dataSync.fullSync();
+      } else {
+        const accounts = await dataSync.syncAccounts();
+        for (const account of accounts) {
+          await dataSync.syncPositions(account.number);
+        }
+        result = { success: true, accountsSynced: accounts.length };
+      }
     }
     
     res.json({
@@ -198,9 +306,127 @@ router.post('/sync', async (req, res) => {
     logger.error('Error syncing portfolio:', error);
     res.status(500).json({
       success: false,
-      error: 'Failed to sync portfolio'
+      error: 'Failed to sync portfolio',
+      message: error.message
     });
   }
-});
+}));
+
+// Sync data for specific person
+router.post('/sync/person/:personName', asyncHandler(async (req, res) => {
+  const { personName } = req.params;
+  const { fullSync = false } = req.body;
+  
+  try {
+    let result;
+    if (fullSync) {
+      result = await dataSync.fullSyncForPerson(personName);
+    } else {
+      result = await dataSync.quickSyncForPerson(personName);
+    }
+    
+    res.json({
+      success: true,
+      message: `Sync completed for ${personName}`,
+      data: result
+    });
+  } catch (error) {
+    logger.error(`Error syncing data for ${personName}:`, error);
+    res.status(500).json({
+      success: false,
+      error: `Failed to sync data for ${personName}`,
+      message: error.message
+    });
+  }
+}));
+
+// Sync data for all persons
+router.post('/sync/all-persons', asyncHandler(async (req, res) => {
+  const { fullSync = false } = req.body;
+  
+  try {
+    const result = await dataSync.syncAllPersons(fullSync);
+    
+    res.json({
+      success: true,
+      message: 'Sync completed for all persons',
+      data: result
+    });
+  } catch (error) {
+    logger.error('Error syncing all persons:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to sync all persons',
+      message: error.message
+    });
+  }
+}));
+
+// Get sync status
+router.get('/sync/status', asyncHandler(async (req, res) => {
+  const { personName } = req.query;
+  
+  try {
+    let result;
+    
+    if (personName) {
+      // Get status for specific person
+      const person = await Person.findOne({ personName });
+      if (!person) {
+        return res.status(404).json({
+          success: false,
+          error: 'Person not found'
+        });
+      }
+      
+      const accounts = await Account.find({ personName });
+      const positionCount = await Position.countDocuments({ personName });
+      const activityCount = await Activity.countDocuments({ personName });
+      
+      result = {
+        personName,
+        lastSuccessfulSync: person.lastSuccessfulSync,
+        lastSyncError: person.lastSyncError,
+        hasValidToken: person.hasValidToken,
+        accounts: accounts.length,
+        positions: positionCount,
+        activities: activityCount
+      };
+    } else {
+      // Get status for all persons
+      const persons = await Person.find({ isActive: true });
+      const results = await Promise.all(
+        persons.map(async (person) => {
+          const accounts = await Account.countDocuments({ personName: person.personName });
+          const positions = await Position.countDocuments({ personName: person.personName });
+          const activities = await Activity.countDocuments({ personName: person.personName });
+          
+          return {
+            personName: person.personName,
+            lastSuccessfulSync: person.lastSuccessfulSync,
+            lastSyncError: person.lastSyncError,
+            hasValidToken: person.hasValidToken,
+            accounts,
+            positions,
+            activities
+          };
+        })
+      );
+      
+      result = results;
+    }
+    
+    res.json({
+      success: true,
+      data: result
+    });
+  } catch (error) {
+    logger.error('Error getting sync status:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to get sync status'
+    });
+  }
+}));
 
 module.exports = router;

@@ -1,3 +1,4 @@
+// models/Token.js
 const mongoose = require('mongoose');
 const crypto = require('crypto');
 
@@ -6,6 +7,11 @@ const tokenSchema = new mongoose.Schema({
     type: String,
     enum: ['refresh', 'access'],
     required: true
+  },
+  personName: {
+    type: String,
+    required: true,
+    index: true
   },
   token: {
     type: String,
@@ -22,6 +28,15 @@ const tokenSchema = new mongoose.Schema({
     type: Boolean,
     default: true
   },
+  
+  // Error tracking
+  lastError: String,
+  errorCount: {
+    type: Number,
+    default: 0
+  },
+  lastSuccessfulUse: Date,
+  
   createdAt: {
     type: Date,
     default: Date.now
@@ -66,5 +81,26 @@ tokenSchema.methods.getDecryptedToken = function() {
   
   return decrypted;
 };
+
+// Method to mark token as used successfully
+tokenSchema.methods.markAsUsed = function() {
+  this.lastUsed = new Date();
+  this.lastSuccessfulUse = new Date();
+  this.errorCount = 0;
+  this.lastError = null;
+  return this.save();
+};
+
+// Method to record error
+tokenSchema.methods.recordError = function(errorMessage) {
+  this.lastError = errorMessage;
+  this.errorCount = (this.errorCount || 0) + 1;
+  this.lastUsed = new Date();
+  return this.save();
+};
+
+// Compound indexes for efficient queries
+tokenSchema.index({ personName: 1, type: 1, isActive: 1 });
+tokenSchema.index({ type: 1, isActive: 1, expiresAt: 1 });
 
 module.exports = mongoose.model('Token', tokenSchema);

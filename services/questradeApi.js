@@ -1,143 +1,52 @@
 // services/questradeApi.js
 const axios = require('axios');
-const Token = require('../models/Token');
+const tokenManager = require('./tokenManager');
 const logger = require('../utils/logger');
 
 class QuestradeAPI {
   constructor() {
     this.authUrl = process.env.QUESTRADE_AUTH_URL || 'https://login.questrade.com';
-    this.apiServer = null;
-    this.accessToken = null;
-    this.tokenExpiry = null;
+    // Cache for storing person-specific API servers and tokens
+    this.personCache = new Map();
   }
 
-  // Refresh access token using refresh token
-  async refreshAccessToken() {
+  // Legacy refresh access token (uses first person or specified person)
+  async refreshAccessToken(personName = null) {
     try {
-      // Get the latest refresh token from database
-      const refreshTokenDoc = await Token.findOne({ 
-        type: 'refresh', 
-        isActive: true 
-      }).sort({ createdAt: -1 });
-
-      if (!refreshTokenDoc) {
-        throw new Error('No active refresh token found. Please run setup again or update refresh token via API.');
-      }
-
-      const refreshToken = refreshTokenDoc.getDecryptedToken();
-      
-      logger.info('Attempting to refresh access token...');
-      
-      const response = await axios.post(`${this.authUrl}/oauth2/token`, null, {
-        params: {
-          grant_type: 'refresh_token',
-          refresh_token: refreshToken
-        },
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded'
+      if (!personName) {
+        // For backward compatibility, find first active person
+        const Person = require('../models/Person');
+        const firstPerson = await Person.findOne({ isActive: true });
+        if (!firstPerson) {
+          throw new Error('No active persons found. Please add a person first.');
         }
-      });
-
-      const { access_token, refresh_token: newRefreshToken, api_server, expires_in } = response.data;
-
-      if (!access_token || !newRefreshToken) {
-        throw new Error('Invalid response from Questrade API - missing tokens');
+        personName = firstPerson.personName;
       }
 
-      // IMPORTANT: Deactivate ALL old tokens
-      await Token.updateMany({ isActive: true }, { isActive: false });
-
-      // Save new access token
-      const newAccessToken = await Token.create({
-        type: 'access',
-        token: access_token,
-        apiServer: api_server,
-        expiresAt: new Date(Date.now() + (expires_in * 1000)),
-        isActive: true
-      });
-
-      // CRITICAL: Save the NEW refresh token (Questrade provides a new one each time)
-      const newRefreshTokenDoc = await Token.create({
-        type: 'refresh',
-        token: newRefreshToken,
-        expiresAt: new Date(Date.now() + (7 * 24 * 60 * 60 * 1000)), // 7 days
-        isActive: true
-      });
-
-      // Update instance variables
-      this.apiServer = api_server;
-      this.accessToken = access_token;
-      this.tokenExpiry = new Date(Date.now() + (expires_in * 1000));
-
-      logger.info('Access token refreshed successfully');
-      logger.info(`New API server: ${api_server}`);
-      logger.info(`Access token expires at: ${this.tokenExpiry}`);
-      logger.info('New refresh token saved for next use');
-      
-      return { 
-        accessToken: access_token, 
-        apiServer: api_server,
-        expiresAt: this.tokenExpiry
-      };
+      return await tokenManager.refreshAccessToken(personName);
     } catch (error) {
-      if (error.response) {
-        logger.error('Questrade API error:', {
-          status: error.response.status,
-          data: error.response.data,
-          headers: error.response.headers
-        });
-        
-        if (error.response.status === 400) {
-          throw new Error('Invalid or expired refresh token. Please get a new refresh token from Questrade and run setup again.');
-        }
-      }
-      
-      logger.error('Error refreshing access token:', error.message);
+      logger.error(`Error in legacy refreshAccessToken:`, error);
       throw error;
     }
   }
 
-  // Get valid access token (refresh if needed)
-  async getValidAccessToken() {
+  // Get valid access token for specific person
+  async getValidAccessToken(personName) {
     try {
-      // Check if current in-memory token is still valid
-      if (this.accessToken && this.tokenExpiry && new Date() < this.tokenExpiry) {
-        logger.debug('Using cached access token');
-        return { accessToken: this.accessToken, apiServer: this.apiServer };
-      }
-
-      // Try to get from database
-      const accessTokenDoc = await Token.findOne({
-        type: 'access',
-        isActive: true,
-        expiresAt: { $gt: new Date() }
-      }).sort({ createdAt: -1 });
-
-      if (accessTokenDoc) {
-        this.accessToken = accessTokenDoc.getDecryptedToken();
-        this.apiServer = accessTokenDoc.apiServer;
-        this.tokenExpiry = accessTokenDoc.expiresAt;
-        
-        logger.debug('Using access token from database');
-        return { accessToken: this.accessToken, apiServer: this.apiServer };
-      }
-
-      // Need to refresh
-      logger.info('Access token expired or not found, refreshing...');
-      return await this.refreshAccessToken();
+      return await tokenManager.getValidAccessToken(personName);
     } catch (error) {
-      logger.error('Error getting valid access token:', error);
+      logger.error(`Error getting valid access token for ${personName}:`, error);
       throw error;
     }
   }
 
-  // Make authenticated API request with retry logic
-  async makeRequest(endpoint, method = 'GET', data = null, retryCount = 0) {
+  // Make authenticated API request with person context
+  async makeRequest(endpoint, personName, method = 'GET', data = null, retryCount = 0) {
     try {
-      const { accessToken, apiServer } = await this.getValidAccessToken();
+      const { accessToken, apiServer } = await this.getValidAccessToken(personName);
       
       if (!apiServer || !accessToken) {
-        throw new Error('Unable to get valid API credentials');
+        throw new Error(`Unable to get valid API credentials for ${personName}`);
       }
       
       const config = {
@@ -153,13 +62,13 @@ class QuestradeAPI {
         config.data = data;
       }
 
-      logger.debug(`Making ${method} request to ${endpoint}`);
+      logger.debug(`Making ${method} request to ${endpoint} for ${personName}`);
       const response = await axios(config);
       
       return response.data;
     } catch (error) {
       if (error.response) {
-        logger.error(`API request failed for ${endpoint}:`, {
+        logger.error(`API request failed for ${endpoint} (${personName}):`, {
           status: error.response.status,
           statusText: error.response.statusText,
           data: error.response.data
@@ -167,67 +76,70 @@ class QuestradeAPI {
         
         // If unauthorized and haven't retried yet, try refreshing token once
         if (error.response.status === 401 && retryCount === 0) {
-          logger.info('Received 401, attempting to refresh token and retry...');
-          await this.refreshAccessToken();
-          return this.makeRequest(endpoint, method, data, retryCount + 1);
+          logger.info(`Received 401 for ${personName}, attempting to refresh token and retry...`);
+          await tokenManager.refreshAccessToken(personName);
+          return this.makeRequest(endpoint, personName, method, data, retryCount + 1);
         }
+        
+        // Record error in token manager
+        await tokenManager.recordTokenError(personName, error.response.data?.message || error.response.statusText);
         
         // Throw more descriptive error
         const errorMessage = error.response.data?.message || error.response.statusText;
         throw new Error(`Questrade API error (${error.response.status}): ${errorMessage}`);
       }
       
-      logger.error(`Network or other error for ${endpoint}:`, error.message);
+      logger.error(`Network or other error for ${endpoint} (${personName}):`, error.message);
       throw error;
     }
   }
 
-  // Test connection and get server time
-  async testConnection() {
+  // Test connection for specific person
+  async testConnection(personName) {
     try {
-      const result = await this.makeRequest('/time');
-      logger.info('API connection test successful:', result);
+      const result = await this.makeRequest('/time', personName);
+      logger.info(`API connection test successful for ${personName}:`, result);
       return result;
     } catch (error) {
-      logger.error('API connection test failed:', error);
+      logger.error(`API connection test failed for ${personName}:`, error);
       throw error;
     }
   }
 
-  // Account endpoints
-  async getAccounts() {
-    return this.makeRequest('/accounts');
+  // Account endpoints with person context
+  async getAccounts(personName) {
+    return this.makeRequest('/accounts', personName);
   }
 
-  async getAccountPositions(accountId) {
-    return this.makeRequest(`/accounts/${accountId}/positions`);
+  async getAccountPositions(accountId, personName) {
+    return this.makeRequest(`/accounts/${accountId}/positions`, personName);
   }
 
-  async getAccountBalances(accountId) {
-    return this.makeRequest(`/accounts/${accountId}/balances`);
+  async getAccountBalances(accountId, personName) {
+    return this.makeRequest(`/accounts/${accountId}/balances`, personName);
   }
 
-  async getAccountActivities(accountId, startTime, endTime) {
+  async getAccountActivities(accountId, personName, startTime, endTime) {
     const params = new URLSearchParams();
     if (startTime) params.append('startTime', startTime);
     if (endTime) params.append('endTime', endTime);
     
     const queryString = params.toString();
     const endpoint = `/accounts/${accountId}/activities${queryString ? '?' + queryString : ''}`;
-    return this.makeRequest(endpoint);
+    return this.makeRequest(endpoint, personName);
   }
 
-  async getAccountOrders(accountId, stateFilter = null) {
+  async getAccountOrders(accountId, personName, stateFilter = null) {
     const params = stateFilter ? `?stateFilter=${stateFilter}` : '';
-    return this.makeRequest(`/accounts/${accountId}/orders${params}`);
+    return this.makeRequest(`/accounts/${accountId}/orders${params}`, personName);
   }
 
-  // Market data endpoints
-  async getSymbol(symbolId) {
-    return this.makeRequest(`/symbols/${symbolId}`);
+  // Market data endpoints with person context
+  async getSymbol(symbolId, personName) {
+    return this.makeRequest(`/symbols/${symbolId}`, personName);
   }
 
-  async getSymbols(ids = null, names = null) {
+  async getSymbols(ids = null, names = null, personName) {
     // Ensure we have either ids or names
     if (!ids && !names) {
       throw new Error('Either ids or names must be provided');
@@ -238,18 +150,18 @@ class QuestradeAPI {
     if (names) params.append('names', names);
     
     const queryString = params.toString();
-    return this.makeRequest(`/symbols${queryString ? '?' + queryString : ''}`);
+    return this.makeRequest(`/symbols${queryString ? '?' + queryString : ''}`, personName);
   }
 
-  async getMarketQuote(symbolIds) {
+  async getMarketQuote(symbolIds, personName) {
     const ids = Array.isArray(symbolIds) ? symbolIds.join(',') : symbolIds;
-    return this.makeRequest(`/markets/quotes?ids=${ids}`);
+    return this.makeRequest(`/markets/quotes?ids=${ids}`, personName);
   }
 
   // Snap quote for real-time price (counts against limit)
-  async getSnapQuote(symbolIds) {
+  async getSnapQuote(symbolIds, personName) {
     const ids = Array.isArray(symbolIds) ? symbolIds.join(',') : symbolIds;
-    const quotes = await this.makeRequest(`/markets/quotes?ids=${ids}`);
+    const quotes = await this.makeRequest(`/markets/quotes?ids=${ids}`, personName);
     
     // Mark as snap quote
     if (quotes && quotes.quotes) {
@@ -262,32 +174,142 @@ class QuestradeAPI {
     return quotes;
   }
 
-  async getMarkets() {
-    return this.makeRequest('/markets');
+  async getMarkets(personName) {
+    return this.makeRequest('/markets', personName);
   }
 
-  async getMarketCandles(symbolId, startTime, endTime, interval) {
+  async getMarketCandles(symbolId, startTime, endTime, interval, personName) {
     const params = new URLSearchParams({
       startTime,
       endTime,
       interval
     });
     
-    return this.makeRequest(`/markets/candles/${symbolId}?${params.toString()}`);
+    return this.makeRequest(`/markets/candles/${symbolId}?${params.toString()}`, personName);
   }
 
   // Helper to search for a symbol
-  async searchSymbol(symbol) {
+  async searchSymbol(symbol, personName) {
     try {
-      const result = await this.getSymbols(null, symbol);
+      const result = await this.getSymbols(null, symbol, personName);
       if (result.symbols && result.symbols.length > 0) {
         return result.symbols[0];
       }
       return null;
     } catch (error) {
-      logger.error(`Error searching for symbol ${symbol}:`, error);
+      logger.error(`Error searching for symbol ${symbol} (${personName}):`, error);
       return null;
     }
+  }
+
+  // Legacy methods for backward compatibility (use first active person)
+  async legacyGetAccounts() {
+    const Person = require('../models/Person');
+    const firstPerson = await Person.findOne({ isActive: true });
+    if (!firstPerson) {
+      throw new Error('No active persons found');
+    }
+    return this.getAccounts(firstPerson.personName);
+  }
+
+  async legacyGetAccountPositions(accountId) {
+    const Account = require('../models/Account');
+    const account = await Account.findOne({ accountId });
+    if (!account) {
+      throw new Error('Account not found');
+    }
+    return this.getAccountPositions(accountId, account.personName);
+  }
+
+  async legacyGetAccountBalances(accountId) {
+    const Account = require('../models/Account');
+    const account = await Account.findOne({ accountId });
+    if (!account) {
+      throw new Error('Account not found');
+    }
+    return this.getAccountBalances(accountId, account.personName);
+  }
+
+  async legacyGetAccountActivities(accountId, startTime, endTime) {
+    const Account = require('../models/Account');
+    const account = await Account.findOne({ accountId });
+    if (!account) {
+      throw new Error('Account not found');
+    }
+    return this.getAccountActivities(accountId, account.personName, startTime, endTime);
+  }
+
+  // Multi-person operations
+  async getAllAccountsForAllPersons() {
+    const Person = require('../models/Person');
+    const persons = await Person.find({ isActive: true });
+    
+    const results = {};
+    
+    for (const person of persons) {
+      try {
+        const accounts = await this.getAccounts(person.personName);
+        results[person.personName] = {
+          success: true,
+          accounts: accounts.accounts || []
+        };
+      } catch (error) {
+        logger.error(`Error getting accounts for ${person.personName}:`, error);
+        results[person.personName] = {
+          success: false,
+          error: error.message
+        };
+      }
+    }
+    
+    return results;
+  }
+
+  async getPositionsForAllPersons() {
+    const Person = require('../models/Person');
+    const Account = require('../models/Account');
+    const persons = await Person.find({ isActive: true });
+    
+    const results = {};
+    
+    for (const person of persons) {
+      try {
+        const accounts = await Account.find({ personName: person.personName });
+        const personPositions = {};
+        
+        for (const account of accounts) {
+          try {
+            const positions = await this.getAccountPositions(account.accountId, person.personName);
+            personPositions[account.accountId] = {
+              success: true,
+              positions: positions.positions || []
+            };
+          } catch (error) {
+            logger.error(`Error getting positions for ${account.accountId} (${person.personName}):`, error);
+            personPositions[account.accountId] = {
+              success: false,
+              error: error.message
+            };
+          }
+        }
+        
+        results[person.personName] = personPositions;
+      } catch (error) {
+        logger.error(`Error processing positions for ${person.personName}:`, error);
+        results[person.personName] = {
+          error: error.message
+        };
+      }
+    }
+    
+    return results;
+  }
+
+  // Get person name from account ID
+  async getPersonNameFromAccount(accountId) {
+    const Account = require('../models/Account');
+    const account = await Account.findOne({ accountId });
+    return account ? account.personName : null;
   }
 }
 

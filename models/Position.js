@@ -1,7 +1,13 @@
+// models/Position.js
 const mongoose = require('mongoose');
 
 const positionSchema = new mongoose.Schema({
   accountId: {
+    type: String,
+    required: true,
+    index: true
+  },
+  personName: {
     type: String,
     required: true,
     index: true
@@ -43,8 +49,12 @@ const positionSchema = new mongoose.Schema({
     dividendReturnPercent: Number,
     yieldOnCost: Number,
     dividendAdjustedCost: Number,
+    dividendAdjustedCostPerShare: Number,
     monthlyDividend: Number,
-    annualDividend: Number
+    monthlyDividendPerShare: Number,
+    annualDividend: Number,
+    annualDividendPerShare: Number,
+    dividendFrequency: Number
   },
   
   // Market data cache
@@ -60,6 +70,13 @@ const positionSchema = new mongoose.Schema({
     lastUpdated: Date
   },
   
+  // Aggregation support
+  isAggregated: {
+    type: Boolean,
+    default: false
+  },
+  sourceAccounts: [String], // List of account IDs that contributed to this aggregated position
+  
   syncedAt: {
     type: Date,
     default: Date.now
@@ -74,7 +91,15 @@ const positionSchema = new mongoose.Schema({
   }
 });
 
-// Compound index for account and symbol
+// Update the updatedAt field before saving
+positionSchema.pre('save', function(next) {
+  this.updatedAt = new Date();
+  next();
+});
+
+// Compound indexes for efficient queries
 positionSchema.index({ accountId: 1, symbol: 1 }, { unique: true });
+positionSchema.index({ personName: 1, symbol: 1 });
+positionSchema.index({ personName: 1, accountId: 1 });
 
 module.exports = mongoose.model('Position', positionSchema);

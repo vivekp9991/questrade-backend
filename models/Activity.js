@@ -7,6 +7,11 @@ const activitySchema = new mongoose.Schema({
     required: true,
     index: true
   },
+  personName: {
+    type: String,
+    required: true,
+    index: true
+  },
   
   tradeDate: Date,
   transactionDate: Date,
@@ -52,8 +57,10 @@ const activitySchema = new mongoose.Schema({
   }
 });
 
-// Compound index for efficient queries
+// Compound indexes for efficient queries
 activitySchema.index({ accountId: 1, type: 1, transactionDate: -1 });
+activitySchema.index({ personName: 1, type: 1, transactionDate: -1 });
 activitySchema.index({ symbol: 1, type: 1, transactionDate: -1 });
+activitySchema.index({ personName: 1, symbol: 1, type: 1 });
 
 module.exports = mongoose.model('Activity', activitySchema);
