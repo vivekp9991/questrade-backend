@@ -4,6 +4,7 @@ const Activity = require('../models/Activity');
 const Account = require('../models/Account');
 const Symbol = require('../models/Symbol');
 const logger = require('../utils/logger');
+const Person = require('../models/Person');
 
 class AccountAggregator {
   
