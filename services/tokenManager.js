@@ -1,4 +1,4 @@
-// services/tokenManager.js - FIXED VERSION with correct Questrade API call
+// services/tokenManager.js - FIXED VERSION - Uses new Token model
 const Token = require('../models/Token');
 const Person = require('../models/Person');
 const logger = require('../utils/logger');
@@ -60,7 +60,7 @@ class TokenManager {
       
       logger.info(`Attempting to refresh access token for ${personName}...`);
       
-      // FIXED: Use GET request with query parameters as per Questrade API documentation
+      // Use GET request with query parameters as per Questrade API documentation
       const response = await axios.get(`${this.authUrl}/oauth2/token`, {
         params: {
           grant_type: 'refresh_token',
@@ -78,8 +78,8 @@ class TokenManager {
       // Delete all old tokens for this person to avoid duplicates
       await Token.deleteMany({ personName });
 
-      // Save new access token
-      await Token.create({
+      // Save new access token using createWithToken method
+      const accessTokenDoc = Token.createWithToken({
         type: 'access',
         personName,
         token: access_token,
@@ -87,15 +87,17 @@ class TokenManager {
         expiresAt: new Date(Date.now() + (expires_in * 1000)),
         isActive: true
       });
+      await accessTokenDoc.save();
 
-      // Save new refresh token
-      await Token.create({
+      // Save new refresh token using createWithToken method
+      const refreshTokenNewDoc = Token.createWithToken({
         type: 'refresh',
         personName,
         token: newRefreshToken,
         expiresAt: new Date(Date.now() + (7 * 24 * 60 * 60 * 1000)), // 7 days
         isActive: true
       });
+      await refreshTokenNewDoc.save();
 
       // Update person record
       await Person.findOneAndUpdate(
@@ -156,7 +158,7 @@ class TokenManager {
       
       logger.info(`Setting up token for ${personName}...`);
       
-      // FIXED: Validate the refresh token by trying to get an access token using GET request
+      // Validate the refresh token by trying to get an access token using GET request
       const testResponse = await axios.get(`${this.authUrl}/oauth2/token`, {
         params: {
           grant_type: 'refresh_token',
@@ -172,17 +174,18 @@ class TokenManager {
       // Delete all old tokens for this person (to avoid duplicate key errors)
       await Token.deleteMany({ personName });
 
-      // Save the validated refresh token
-      await Token.create({
+      // Save the validated refresh token using createWithToken method
+      const refreshTokenDoc = Token.createWithToken({
         type: 'refresh',
         personName,
         token: cleanToken,
         expiresAt: new Date(Date.now() + (7 * 24 * 60 * 60 * 1000)), // 7 days
         isActive: true
       });
+      await refreshTokenDoc.save();
 
-      // Also save the access token we just received
-      await Token.create({
+      // Also save the access token we just received using createWithToken method
+      const accessTokenDoc = Token.createWithToken({
         type: 'access',
         personName,
         token: testResponse.data.access_token,
@@ -190,6 +193,7 @@ class TokenManager {
         expiresAt: new Date(Date.now() + (testResponse.data.expires_in * 1000)),
         isActive: true
       });
+      await accessTokenDoc.save();
 
       // Create or update person record
       await Person.findOneAndUpdate(
@@ -339,7 +343,8 @@ class TokenManager {
         { 
           $inc: { errorCount: 1 },
           lastError: errorMessage,
-          lastUsed: new Date()
+          lastUsed: new Date(),
+          updatedAt: new Date()
         }
       );
 
@@ -362,7 +367,7 @@ class TokenManager {
       // Deactivate all tokens
       await Token.updateMany(
         { personName, isActive: true },
-        { isActive: false }
+        { isActive: false, updatedAt: new Date() }
       );
 
       // Deactivate person
@@ -402,7 +407,7 @@ class TokenManager {
         };
       }
 
-      // FIXED: Test with Questrade API using GET request
+      // Test with Questrade API using GET request
       const response = await axios.get(`${this.authUrl}/oauth2/token`, {
         params: {
           grant_type: 'refresh_token',

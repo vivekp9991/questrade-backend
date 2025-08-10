@@ -1,4 +1,4 @@
-// models/Token.js - FIXED VERSION
+// models/Token.js - FIXED VERSION - Resolves validation error
 const mongoose = require('mongoose');
 const crypto = require('crypto');
 
@@ -11,13 +11,13 @@ const tokenSchema = new mongoose.Schema({
   personName: {
     type: String,
     required: true,
-    index: true // Changed from unique to regular index
+    index: true
   },
-  token: {
+  // Remove token field from schema since we only store encrypted version
+  encryptedToken: {
     type: String,
     required: true
   },
-  encryptedToken: String,
   apiServer: String,
   expiresAt: {
     type: Date,
@@ -47,39 +47,52 @@ const tokenSchema = new mongoose.Schema({
   }
 });
 
-// Encrypt token before saving
-tokenSchema.pre('save', function(next) {
-  if (this.isModified('token')) {
-    const algorithm = 'aes-256-cbc';
-    const key = Buffer.from(process.env.ENCRYPTION_KEY || 'default_key_32_chars_long_here!!', 'utf8');
-    const iv = crypto.randomBytes(16);
-    const cipher = crypto.createCipheriv(algorithm, key, iv);
-    
-    let encrypted = cipher.update(this.token, 'utf8', 'hex');
-    encrypted += cipher.final('hex');
-    
-    this.encryptedToken = iv.toString('hex') + ':' + encrypted;
-    this.token = undefined; // Don't store plain token
+// Static method to create encrypted token
+tokenSchema.statics.createWithToken = function(tokenData) {
+  const { token, ...otherData } = tokenData;
+  
+  if (!token) {
+    throw new Error('Token is required');
   }
-  this.updatedAt = Date.now();
-  next();
-});
+  
+  // Encrypt the token
+  const algorithm = 'aes-256-cbc';
+  const key = Buffer.from(process.env.ENCRYPTION_KEY || 'default_key_32_chars_long_here!!', 'utf8');
+  const iv = crypto.randomBytes(16);
+  const cipher = crypto.createCipheriv(algorithm, key, iv);
+  
+  let encrypted = cipher.update(token, 'utf8', 'hex');
+  encrypted += cipher.final('hex');
+  
+  const encryptedToken = iv.toString('hex') + ':' + encrypted;
+  
+  // Create the document with encrypted token
+  return new this({
+    ...otherData,
+    encryptedToken
+  });
+};
 
-// Decrypt token method
+// Method to decrypt token
 tokenSchema.methods.getDecryptedToken = function() {
   if (!this.encryptedToken) return null;
   
-  const algorithm = 'aes-256-cbc';
-  const key = Buffer.from(process.env.ENCRYPTION_KEY || 'default_key_32_chars_long_here!!', 'utf8');
-  const parts = this.encryptedToken.split(':');
-  const iv = Buffer.from(parts[0], 'hex');
-  const encryptedText = parts[1];
-  
-  const decipher = crypto.createDecipheriv(algorithm, key, iv);
-  let decrypted = decipher.update(encryptedText, 'hex', 'utf8');
-  decrypted += decipher.final('utf8');
-  
-  return decrypted;
+  try {
+    const algorithm = 'aes-256-cbc';
+    const key = Buffer.from(process.env.ENCRYPTION_KEY || 'default_key_32_chars_long_here!!', 'utf8');
+    const parts = this.encryptedToken.split(':');
+    const iv = Buffer.from(parts[0], 'hex');
+    const encryptedText = parts[1];
+    
+    const decipher = crypto.createDecipheriv(algorithm, key, iv);
+    let decrypted = decipher.update(encryptedText, 'hex', 'utf8');
+    decrypted += decipher.final('utf8');
+    
+    return decrypted;
+  } catch (error) {
+    console.error('Token decryption failed:', error);
+    return null;
+  }
 };
 
 // Method to mark token as used successfully
@@ -88,6 +101,7 @@ tokenSchema.methods.markAsUsed = function() {
   this.lastSuccessfulUse = new Date();
   this.errorCount = 0;
   this.lastError = null;
+  this.updatedAt = new Date();
   return this.save();
 };
 
@@ -96,14 +110,21 @@ tokenSchema.methods.recordError = function(errorMessage) {
   this.lastError = errorMessage;
   this.errorCount = (this.errorCount || 0) + 1;
   this.lastUsed = new Date();
+  this.updatedAt = new Date();
   return this.save();
 };
 
-// Compound indexes for efficient queries (but not unique on personName alone)
+// Update timestamp before saving
+tokenSchema.pre('save', function(next) {
+  this.updatedAt = new Date();
+  next();
+});
+
+// Compound indexes for efficient queries
 tokenSchema.index({ personName: 1, type: 1, isActive: 1 });
 tokenSchema.index({ type: 1, isActive: 1, expiresAt: 1 });
 
-// Create a unique compound index that allows multiple tokens per person but prevents exact duplicates
+// Create a unique compound index that prevents exact duplicates
 tokenSchema.index({ personName: 1, type: 1, createdAt: 1 }, { unique: true });
 
 module.exports = mongoose.model('Token', tokenSchema);
