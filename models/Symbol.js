@@ -32,10 +32,19 @@ const symbolSchema = new mongoose.Schema({
   
   // Dividend info
   dividend: Number,
+  dividendPerShare: Number,
   yield: Number,
   exDate: Date,
   dividendDate: Date,
   dividendFrequency: String, // Annual, Quarterly, Monthly
+  
+   // Industry classification
+  industrySector: String,
+  industryGroup: String,
+  industrySubGroup: String,
+
+  // Additional market info
+  minTicks: mongoose.Schema.Types.Mixed,
   
   // Financial metrics
   eps: Number,

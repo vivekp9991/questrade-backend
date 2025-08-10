@@ -5,6 +5,7 @@ const portfolioCalculator = require('../services/portfolioCalculator');
 const dataSync = require('../services/dataSync');
 const Position = require('../models/Position');
 const Account = require('../models/Account');
+const Symbol = require('../models/Symbol');
 const Activity = require('../models/Activity');
 const PortfolioSnapshot = require('../models/PortfolioSnapshot');
 const logger = require('../utils/logger');
@@ -38,11 +39,26 @@ router.get('/positions', async (req, res) => {
     const query = accountId ? { accountId } : {};
     
     const positions = await Position.find(query)
-      .sort({ currentMarketValue: -1 });
+      .sort({ currentMarketValue: -1 })
+      .lean();
+
+    const symbolIds = positions.map(p => p.symbolId);
+    const symbols = await Symbol.find({ symbolId: { $in: symbolIds } }).lean();
+    const symbolMap = {};
+    symbols.forEach(sym => { symbolMap[sym.symbolId] = sym; });
+
+    const enrichedPositions = positions.map(p => ({
+      ...p,
+      dividendPerShare: symbolMap[p.symbolId]?.dividendPerShare ?? symbolMap[p.symbolId]?.dividend,
+      industrySector: symbolMap[p.symbolId]?.industrySector,
+      industryGroup: symbolMap[p.symbolId]?.industryGroup,
+      industrySubGroup: symbolMap[p.symbolId]?.industrySubGroup
+    }));
+
     
     res.json({
       success: true,
-      data: positions
+      data: enrichedPositions
     });
   } catch (error) {
     logger.error('Error getting positions:', error);
@@ -70,10 +86,20 @@ router.get('/positions/:symbol', async (req, res) => {
         error: 'Position not found'
       });
     }
+
+    const symbolInfo = await Symbol.findOne({ symbolId: position.symbolId }).lean();
+    const enrichedPosition = {
+      ...position,
+      dividendPerShare: symbolInfo?.dividendPerShare ?? symbolInfo?.dividend,
+      industrySector: symbolInfo?.industrySector,
+      industryGroup: symbolInfo?.industryGroup,
+      industrySubGroup: symbolInfo?.industrySubGroup
+    };
+
     
     res.json({
       success: true,
-      data: position
+      data: enrichedPosition
     });
   } catch (error) {
     logger.error('Error getting position:', error);
