@@ -130,15 +130,25 @@ class AccountAggregator {
       
       // Dividend metrics
       const dividendReturnPercent = totalCost > 0 ? (totalDividendsReceived / totalCost) * 100 : 0;
-      const yieldOnCost = weightedAverageCost > 0 && totalShares > 0 
-        ? ((totalAnnualDividend / totalShares) / weightedAverageCost) * 100 
+      const yieldOnCost = weightedAverageCost > 0 && totalShares > 0
+        ? ((totalAnnualDividend / totalShares) / weightedAverageCost) * 100
         : 0;
       const currentYield = latestPrice > 0 && totalShares > 0
         ? ((totalAnnualDividend / totalShares) / latestPrice) * 100
         : 0;
-      const dividendAdjustedCost = totalShares > 0 
-        ? weightedAverageCost - (totalDividendsReceived / totalShares)
-        : weightedAverageCost;
+       // When no dividends have been received, keep original cost values
+      // rather than subtracting zero or returning confusing numbers.
+      // If dividends exist, adjust the cost accordingly.
+      let dividendAdjustedCostPerShare;
+      let dividendAdjustedCost;
+
+      if (totalDividendsReceived > 0 && totalShares > 0) {
+        dividendAdjustedCostPerShare = weightedAverageCost - (totalDividendsReceived / totalShares);
+        dividendAdjustedCost = dividendAdjustedCostPerShare * totalShares;
+      } else {
+        dividendAdjustedCostPerShare = totalShares > 0 ? weightedAverageCost : null;
+        dividendAdjustedCost = totalCost > 0 ? totalCost : null;
+      }
 
       // Create aggregated position
       return {
@@ -171,8 +181,8 @@ class AccountAggregator {
           totalReceived: totalDividendsReceived,
           dividendReturnPercent,
           yieldOnCost,
-          dividendAdjustedCost: dividendAdjustedCost * totalShares,
-          dividendAdjustedCostPerShare: dividendAdjustedCost,
+          dividendAdjustedCost,
+          dividendAdjustedCostPerShare,
           monthlyDividend: totalMonthlyDividend,
           monthlyDividendPerShare: totalShares > 0 ? totalMonthlyDividend / totalShares : 0,
           annualDividend: totalAnnualDividend,

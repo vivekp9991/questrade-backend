@@ -2,7 +2,7 @@
 const mongoose = require('mongoose');
 const readline = require('readline');
 const crypto = require('crypto');
-
+require('dotenv').config();
 // Import models and services with error handling
 let Person, Token, Account, Position, Activity, PortfolioSnapshot;
 let tokenManager, questradeApi, dataSync;
