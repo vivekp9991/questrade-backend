@@ -1,15 +1,41 @@
-// routes/market.js
+// routes/market.js - FIXED VERSION - Auto-detect personName
 const express = require('express');
 const router = express.Router();
 const questradeApi = require('../services/questradeApi');
 const MarketQuote = require('../models/MarketQuote');
 const Symbol = require('../models/Symbol');
+const Person = require('../models/Person');
 const logger = require('../utils/logger');
+
+// Helper function to get default person name
+async function getDefaultPersonName() {
+  try {
+    const firstActivePerson = await Person.findOne({ isActive: true }).sort({ createdAt: 1 });
+    return firstActivePerson ? firstActivePerson.personName : null;
+  } catch (error) {
+    logger.error('Error getting default person:', error);
+    return null;
+  }
+}
 
 // Get market quote (snap quote)
 router.get('/quote/:symbols', async (req, res) => {
   try {
     const { symbols } = req.params;
+    let { personName } = req.query;
+    
+    // Auto-detect personName if not provided
+    if (!personName) {
+      personName = await getDefaultPersonName();
+      if (!personName) {
+        return res.status(400).json({
+          success: false,
+          error: 'No active persons found. Please add a person first or specify personName in query.'
+        });
+      }
+      logger.info(`Auto-detected personName: ${personName} for market quote request`);
+    }
+    
     const symbolList = symbols.split(',');
     
     // Get symbol IDs
@@ -19,31 +45,40 @@ router.get('/quote/:symbols', async (req, res) => {
     
     if (symbolDocs.length === 0) {
       // Try to fetch from API
-      const symbolsData = await questradeApi.getSymbols(null, symbols);
-      
-      if (!symbolsData.symbols || symbolsData.symbols.length === 0) {
-        return res.status(404).json({
+      try {
+        const symbolsData = await questradeApi.getSymbols(null, symbols, personName);
+        
+        if (!symbolsData.symbols || symbolsData.symbols.length === 0) {
+          return res.status(404).json({
+            success: false,
+            error: 'Symbols not found'
+          });
+        }
+        
+        // Save symbols
+        for (const sym of symbolsData.symbols) {
+          await Symbol.findOneAndUpdate(
+            { symbolId: sym.symbolId },
+            sym,
+            { upsert: true }
+          );
+        }
+        
+        symbolDocs.push(...symbolsData.symbols);
+      } catch (symbolError) {
+        logger.error('Error fetching symbols from API:', symbolError);
+        return res.status(500).json({
           success: false,
-          error: 'Symbols not found'
+          error: 'Failed to fetch symbols from Questrade API',
+          details: symbolError.message
         });
       }
-      
-      // Save symbols
-      for (const sym of symbolsData.symbols) {
-        await Symbol.findOneAndUpdate(
-          { symbolId: sym.symbolId },
-          sym,
-          { upsert: true }
-        );
-      }
-      
-      symbolDocs.push(...symbolsData.symbols);
     }
     
     const symbolIds = symbolDocs.map(s => s.symbolId);
     
     // Get snap quotes
-    const quotes = await questradeApi.getSnapQuote(symbolIds);
+    const quotes = await questradeApi.getSnapQuote(symbolIds, personName);
     
     // Save quotes to database
     if (quotes.quotes) {
@@ -74,13 +109,15 @@ router.get('/quote/:symbols', async (req, res) => {
     
     res.json({
       success: true,
-      data: quotes
+      data: quotes,
+      personName // Include which person was used
     });
   } catch (error) {
     logger.error('Error getting market quote:', error);
     res.status(500).json({
       success: false,
-      error: 'Failed to get market quote'
+      error: 'Failed to get market quote',
+      details: error.message
     });
   }
 });
@@ -89,6 +126,19 @@ router.get('/quote/:symbols', async (req, res) => {
 router.get('/symbols/:symbols', async (req, res) => {
   try {
     const { symbols } = req.params;
+    let { personName } = req.query;
+    
+    // Auto-detect personName if not provided
+    if (!personName) {
+      personName = await getDefaultPersonName();
+      if (!personName) {
+        return res.status(400).json({
+          success: false,
+          error: 'No active persons found. Please add a person first or specify personName in query.'
+        });
+      }
+    }
+    
     const symbolList = symbols.split(',');
     
     // Try to get from database first
@@ -98,7 +148,7 @@ router.get('/symbols/:symbols', async (req, res) => {
     
     // If not all found, fetch from API
     if (symbolDocs.length < symbolList.length) {
-      const symbolsData = await questradeApi.getSymbols(null, symbols);
+      const symbolsData = await questradeApi.getSymbols(null, symbols, personName);
       
       if (symbolsData.symbols) {
         for (const sym of symbolsData.symbols) {
@@ -118,13 +168,15 @@ router.get('/symbols/:symbols', async (req, res) => {
     
     res.json({
       success: true,
-      data: symbolDocs
+      data: symbolDocs,
+      personName
     });
   } catch (error) {
     logger.error('Error getting symbols:', error);
     res.status(500).json({
       success: false,
-      error: 'Failed to get symbols'
+      error: 'Failed to get symbols',
+      details: error.message
     });
   }
 });
@@ -134,6 +186,18 @@ router.get('/candles/:symbol', async (req, res) => {
   try {
     const { symbol } = req.params;
     const { startTime, endTime, interval = 'OneDay' } = req.query;
+    let { personName } = req.query;
+    
+    // Auto-detect personName if not provided
+    if (!personName) {
+      personName = await getDefaultPersonName();
+      if (!personName) {
+        return res.status(400).json({
+          success: false,
+          error: 'No active persons found. Please add a person first or specify personName in query.'
+        });
+      }
+    }
     
     // Get symbol ID
     const symbolDoc = await Symbol.findOne({ symbol });
@@ -149,18 +213,21 @@ router.get('/candles/:symbol', async (req, res) => {
       symbolDoc.symbolId,
       startTime,
       endTime,
-      interval
+      interval,
+      personName
     );
     
     res.json({
       success: true,
-      data: candles
+      data: candles,
+      personName
     });
   } catch (error) {
     logger.error('Error getting market candles:', error);
     res.status(500).json({
       success: false,
-      error: 'Failed to get market candles'
+      error: 'Failed to get market candles',
+      details: error.message
     });
   }
 });
