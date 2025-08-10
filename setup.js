@@ -43,43 +43,9 @@ function question(prompt) {
   });
 }
 
-// Utility function for secure password input (hidden)
-function questionHidden(prompt) {
-  return new Promise((resolve) => {
-    process.stdout.write(prompt);
-    process.stdin.setRawMode(true);
-    process.stdin.resume();
-    process.stdin.setEncoding('utf8');
-    
-    let input = '';
-    process.stdin.on('data', function(char) {
-      char = char + '';
-      
-      switch (char) {
-        case '\n':
-        case '\r':
-        case '\u0004':
-          process.stdin.setRawMode(false);
-          process.stdin.pause();
-          process.stdout.write('\n');
-          resolve(input);
-          break;
-        case '\u0003':
-          process.exit();
-          break;
-        case '\u007f': // Backspace
-          if (input.length > 0) {
-            input = input.slice(0, -1);
-            process.stdout.write('\b \b');
-          }
-          break;
-        default:
-          input += char;
-          process.stdout.write('*');
-          break;
-      }
-    });
-  });
+// Utility function for token input (visible for reliability)
+function questionToken(prompt) {
+  return question(prompt);
 }
 
 // Fallback schemas if models not found
@@ -169,7 +135,9 @@ class PortfolioSetup {
 
     // Check if person already exists
     const existingPerson = await Person.findOne({ personName: personName.trim() });
-    if (existingPerson) {
+    const existingToken = await Token.findOne({ personName: personName.trim() });
+    
+    if (existingPerson || existingToken) {
       console.log(`✗ Person "${personName}" already exists`);
       const update = await question('Do you want to update their token instead? (y/n): ');
       if (update.toLowerCase() === 'y') {
@@ -180,7 +148,7 @@ class PortfolioSetup {
 
     // Get refresh token
     console.log('\nGet your refresh token from: https://login.questrade.com/APIAccess/UserApps.aspx');
-    const refreshToken = await questionHidden('Enter Questrade refresh token (hidden): ');
+    const refreshToken = await questionToken('Enter Questrade refresh token: ');
     
     if (!refreshToken.trim()) {
       console.log('✗ Refresh token cannot be empty');
@@ -209,13 +177,16 @@ class PortfolioSetup {
         await tokenManager.setupPersonToken(personName.trim(), refreshToken.trim());
         console.log('✓ Token validated and saved');
       } else {
-        // Fallback token creation
-        const token = new Token({
-          personName: personName.trim(),
-          refreshToken: refreshToken.trim(),
-          createdAt: new Date()
-        });
-        await token.save();
+        // Fallback token creation with upsert to handle duplicates
+        await Token.findOneAndUpdate(
+          { personName: personName.trim() },
+          {
+            personName: personName.trim(),
+            refreshToken: refreshToken.trim(),
+            createdAt: new Date()
+          },
+          { upsert: true, new: true }
+        );
         console.log('✓ Token saved (basic mode)');
       }
 
@@ -254,6 +225,7 @@ class PortfolioSetup {
         console.log('✓ Cleaned up partial setup');
       } catch (cleanupError) {
         console.log('⚠ Failed to cleanup partial setup:', cleanupError.message);
+        console.log('You may need to manually remove the person record and try again.');
       }
     }
   }
@@ -293,7 +265,7 @@ class PortfolioSetup {
 
       console.log(`\nUpdating token for: ${personName}`);
       console.log('Get your refresh token from: https://login.questrade.com/APIAccess/UserApps.aspx');
-      const refreshToken = await questionHidden('Enter new Questrade refresh token (hidden): ');
+      const refreshToken = await questionToken('Enter new Questrade refresh token: ');
 
       if (!refreshToken.trim()) {
         console.log('✗ Refresh token cannot be empty');

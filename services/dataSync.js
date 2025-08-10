@@ -19,7 +19,7 @@ class DataSyncService {
    */
   async syncPersonData(personName, options = {}) {
     const { fullSync = false, forceRefresh = false } = options;
-    
+    console.log("personName ::- " + personName);
     if (this.syncInProgress.get(personName)) {
       throw new Error(`Sync already in progress for ${personName}`);
     }
@@ -337,7 +337,7 @@ class DataSyncService {
     try {
       logger.info(`Syncing activities for ${personName}...`);
       const accounts = await Account.find({ personName });
-      
+      console.log("dataSync :--> " + accounts);
       if (accounts.length === 0) {
         logger.warn(`No accounts found for ${personName}, skipping activity sync`);
         return result;
