@@ -1,4 +1,4 @@
-// services/questradeApi.js
+// services/questradeApi.js - FIXED VERSION
 const axios = require('axios');
 const tokenManager = require('./tokenManager');
 const logger = require('../utils/logger');
@@ -55,7 +55,8 @@ class QuestradeAPI {
         headers: {
           'Authorization': `Bearer ${accessToken}`,
           'Content-Type': 'application/json'
-        }
+        },
+        timeout: 30000 // 30 second timeout
       };
 
       if (data) {
@@ -106,6 +107,17 @@ class QuestradeAPI {
     }
   }
 
+  // Get server time (useful for testing)
+  async getServerTime(personName) {
+    try {
+      const result = await this.makeRequest('/time', personName);
+      return result.time;
+    } catch (error) {
+      logger.error(`Error getting server time for ${personName}:`, error);
+      throw error;
+    }
+  }
+
   // Account endpoints with person context
   async getAccounts(personName) {
     return this.makeRequest('/accounts', personName);
@@ -119,6 +131,7 @@ class QuestradeAPI {
     return this.makeRequest(`/accounts/${accountId}/balances`, personName);
   }
 
+  // FIXED: Corrected parameter order for getAccountActivities
   async getAccountActivities(accountId, personName, startTime, endTime) {
     const params = new URLSearchParams();
     if (startTime) params.append('startTime', startTime);
@@ -310,6 +323,15 @@ class QuestradeAPI {
     const Account = require('../models/Account');
     const account = await Account.findOne({ accountId });
     return account ? account.personName : null;
+  }
+
+  // Helper methods for data sync operations
+  async getPositions(accountId, personName) {
+    return this.getAccountPositions(accountId, personName);
+  }
+
+  async getActivities(accountId, startTime, endTime, personName) {
+    return this.getAccountActivities(accountId, personName, startTime, endTime);
   }
 }
 

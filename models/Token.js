@@ -1,4 +1,4 @@
-// models/Token.js
+// models/Token.js - FIXED VERSION
 const mongoose = require('mongoose');
 const crypto = require('crypto');
 
@@ -11,7 +11,7 @@ const tokenSchema = new mongoose.Schema({
   personName: {
     type: String,
     required: true,
-    index: true
+    index: true // Changed from unique to regular index
   },
   token: {
     type: String,
@@ -99,8 +99,11 @@ tokenSchema.methods.recordError = function(errorMessage) {
   return this.save();
 };
 
-// Compound indexes for efficient queries
+// Compound indexes for efficient queries (but not unique on personName alone)
 tokenSchema.index({ personName: 1, type: 1, isActive: 1 });
 tokenSchema.index({ type: 1, isActive: 1, expiresAt: 1 });
+
+// Create a unique compound index that allows multiple tokens per person but prevents exact duplicates
+tokenSchema.index({ personName: 1, type: 1, createdAt: 1 }, { unique: true });
 
 module.exports = mongoose.model('Token', tokenSchema);
