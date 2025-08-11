@@ -177,19 +177,21 @@ class TokenManager {
         }
       );
 
-      if (!testResponse.data.access_token) {
-        throw new Error('Invalid refresh token - could not obtain access token');
+      const { access_token, refresh_token: newRefreshToken, api_server, expires_in, refresh_token_expires_in } = testResponse.data;
+
+      if (!access_token || !newRefreshToken) {
+        throw new Error('Invalid refresh token - could not obtain new tokens');
       }
 
       // Delete all old tokens for this person (to avoid duplicate key errors)
       await Token.deleteMany({ personName });
 
-      // Save the validated refresh token using createWithToken method
+      // Save the new refresh token returned by Questrade
       const refreshTokenDoc = Token.createWithToken({
         type: 'refresh',
         personName,
-        token: cleanToken,
-        expiresAt: new Date(Date.now() + (7 * 24 * 60 * 60 * 1000)), // 7 days
+        token: newRefreshToken,
+        expiresAt: new Date(Date.now() + ((refresh_token_expires_in || (7 * 24 * 60 * 60)) * 1000)),
         isActive: true
       });
       await refreshTokenDoc.save();
@@ -198,9 +200,9 @@ class TokenManager {
       const accessTokenDoc = Token.createWithToken({
         type: 'access',
         personName,
-        token: testResponse.data.access_token,
-        apiServer: testResponse.data.api_server,
-        expiresAt: new Date(Date.now() + (testResponse.data.expires_in * 1000)),
+        token: access_token,
+        apiServer: api_server,
+        expiresAt: new Date(Date.now() + (expires_in * 1000)),
         isActive: true
       });
       await accessTokenDoc.save();
