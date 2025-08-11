@@ -404,6 +404,21 @@ class DataSyncService {
             syncedAt: new Date()
           };
 
+          // Fetch and store account balances
+          try {
+            const balancesData = await questradeApi.getAccountBalances(accountData.number, personName);
+            if (balancesData) {
+              accountDoc.balances = {
+                perCurrencyBalances: balancesData.perCurrencyBalances || [],
+                combinedBalances: balancesData.combinedBalances || {},
+                lastUpdated: new Date()
+              };
+            }
+          } catch (balanceErr) {
+            logger.error(`Failed to fetch balances for account ${accountData.number}:`, balanceErr);
+          }
+
+
           await Account.findOneAndUpdate(
             { accountId: accountData.number, personName },
             accountDoc,
@@ -540,6 +555,46 @@ class DataSyncService {
               logger.error(`Failed to save position ${positionData.symbol}:`, positionError);
             }
           }
+
+           // Update account statistics after processing positions
+          try {
+            const accountPositions = await Position.find({ accountId: account.accountId, personName });
+            const numberOfPositions = accountPositions.length;
+            const totalInvestment = accountPositions.reduce((sum, p) => sum + (p.totalCost || 0), 0);
+            const currentValue = accountPositions.reduce((sum, p) => sum + (p.currentMarketValue || 0), 0);
+            const dayPnl = accountPositions.reduce((sum, p) => sum + (p.dayPnl || 0), 0);
+            const openPnl = accountPositions.reduce((sum, p) => sum + (p.openPnl || 0), 0);
+            const closedPnl = accountPositions.reduce((sum, p) => sum + (p.closedPnl || 0), 0);
+            const totalPnl = openPnl + closedPnl;
+
+            // Calculate net deposits from activities
+            const depositAgg = await Activity.aggregate([
+              { $match: { accountId: account.accountId, personName, type: 'Deposit' } },
+              { $group: { _id: null, total: { $sum: '$netAmount' } } }
+            ]);
+            const withdrawalAgg = await Activity.aggregate([
+              { $match: { accountId: account.accountId, personName, type: 'Withdrawal' } },
+              { $group: { _id: null, total: { $sum: '$netAmount' } } }
+            ]);
+            const netDeposits = (depositAgg[0]?.total || 0) - (withdrawalAgg[0]?.total || 0);
+
+            await Account.findOneAndUpdate(
+              { accountId: account.accountId, personName },
+              {
+                numberOfPositions,
+                totalInvestment,
+                currentValue,
+                dayPnl,
+                openPnl,
+                closedPnl,
+                totalPnl,
+                netDeposits
+              }
+            );
+          } catch (statErr) {
+            logger.error(`Failed to update stats for account ${account.accountId}:`, statErr);
+          }
+
           
         } catch (accountError) {
           result.errors.push({

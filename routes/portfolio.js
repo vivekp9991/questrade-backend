@@ -45,7 +45,7 @@ router.get('/positions', asyncHandler(async (req, res) => {
   const { viewMode = 'account', personName, accountId, aggregate = 'false' } = req.query;
   
   try {
-    let positions;
+      let accountInfo = null;
     
     if (aggregate === 'true' || viewMode !== 'account') {
       // Use aggregation service
@@ -73,6 +73,9 @@ router.get('/positions', asyncHandler(async (req, res) => {
       }));
     }
 
+     if (viewMode === 'account' && accountId) {
+      accountInfo = await Account.findOne({ accountId }).lean();
+    }
     res.json({
       success: true,
       data: positions,
@@ -82,7 +85,8 @@ router.get('/positions', asyncHandler(async (req, res) => {
         accountId,
         aggregated: aggregate === 'true' || viewMode !== 'account',
         count: positions.length
-      }
+       },
+      account: accountInfo
     });
   } catch (error) {
     logger.error('Error getting positions:', error);

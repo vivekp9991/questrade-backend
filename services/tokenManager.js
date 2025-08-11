@@ -60,14 +60,19 @@ class TokenManager {
       
       logger.info(`Attempting to refresh access token for ${personName}...`);
       
-      // Use GET request with query parameters as per Questrade API documentation
-      const response = await axios.get(`${this.authUrl}/oauth2/token`, {
-        params: {
-          grant_type: 'refresh_token',
-          refresh_token: refreshToken
-        },
-        timeout: 15000 // 15 second timeout
+      // Use POST request with form encoded body as per Questrade API documentation
+      const params = new URLSearchParams({
+        grant_type: 'refresh_token',
+        refresh_token: refreshToken
       });
+      const response = await axios.post(
+        `${this.authUrl}/oauth2/token`,
+        params.toString(),
+        {
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          timeout: 15000 // 15 second timeout
+        }
+      );
 
       const { access_token, refresh_token: newRefreshToken, api_server, expires_in } = response.data;
 
@@ -158,14 +163,19 @@ class TokenManager {
       
       logger.info(`Setting up token for ${personName}...`);
       
-      // Validate the refresh token by trying to get an access token using GET request
-      const testResponse = await axios.get(`${this.authUrl}/oauth2/token`, {
-        params: {
-          grant_type: 'refresh_token',
-          refresh_token: cleanToken
-        },
-        timeout: 15000 // 15 second timeout for initial validation
+    // Validate the refresh token by trying to get an access token using POST request
+      const testParams = new URLSearchParams({
+        grant_type: 'refresh_token',
+        refresh_token: cleanToken
       });
+      const testResponse = await axios.post(
+        `${this.authUrl}/oauth2/token`,
+        testParams.toString(),
+        {
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          timeout: 15000 // 15 second timeout for initial validation
+        }
+      );
 
       if (!testResponse.data.access_token) {
         throw new Error('Invalid refresh token - could not obtain access token');

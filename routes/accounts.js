@@ -57,6 +57,11 @@ router.get('/by-person', asyncHandler(async (req, res) => {
         numberOfPositions: account.numberOfPositions,
         totalInvestment: account.totalInvestment,
         currentValue: account.currentValue,
+         dayPnl: account.dayPnl,
+        openPnl: account.openPnl,
+        closedPnl: account.closedPnl,
+        totalPnl: account.totalPnl,
+        netDeposits: account.netDeposits,
         syncedAt: account.syncedAt
       }))
     };

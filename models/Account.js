@@ -70,7 +70,26 @@ const accountSchema = new mongoose.Schema({
     type: Number,
     default: 0
   },
-  
+  dayPnl: {
+    type: Number,
+    default: 0
+  },
+  openPnl: {
+    type: Number,
+    default: 0
+  },
+  closedPnl: {
+    type: Number,
+    default: 0
+  },
+  totalPnl: {
+    type: Number,
+    default: 0
+  },
+  netDeposits: {
+    type: Number,
+    default: 0
+  },
   createdAt: {
     type: Date,
     default: Date.now
