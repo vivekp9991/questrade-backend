@@ -43,6 +43,12 @@ class AccountAggregator {
         return await this.enrichPositions(positions);
       }
 
+      // Build account map for quick lookup of account details
+      const accountIds = [...new Set(positions.map(p => p.accountId))];
+      const accounts = await Account.find({ accountId: { $in: accountIds } }).lean();
+      const accountMap = {};
+      accounts.forEach(acc => { accountMap[acc.accountId] = acc; });
+
       // Group positions by symbol for aggregation
       const symbolGroups = {};
       
@@ -63,7 +69,7 @@ class AccountAggregator {
           aggregatedPositions.push(positions[0]);
         } else {
           // Multiple positions for same symbol, aggregate them
-          const aggregated = await this.aggregateSymbolPositions(symbol, positions);
+          const aggregated = await this.aggregateSymbolPositions(symbol, positions, accountMap);
           aggregatedPositions.push(aggregated);
         }
       }
@@ -76,7 +82,7 @@ class AccountAggregator {
   }
 
   // Aggregate multiple positions of the same symbol
-  async aggregateSymbolPositions(symbol, positions) {
+  async aggregateSymbolPositions(symbol, positions, accountMap = {}) {
     try {
       // Get symbol info for the aggregated position
       const symbolInfo = await Symbol.findOne({ symbol }).lean();
@@ -151,12 +157,27 @@ class AccountAggregator {
         dividendAdjustedCost = totalCost > 0 ? totalCost : null;
       }
 
-      // Create aggregated position
-      return {
-        symbol,
-        symbolId: positions[0].symbolId, // Same for all positions of this symbol
-        personName: personNames.size === 1 ? Array.from(personNames)[0] : 'Multiple',
-        accountId: 'AGGREGATED',
+          // Map each account's individual position for client display
+        const individualPositions = positions.map(pos => {
+          const account = accountMap[pos.accountId] || {};
+          return {
+            accountId: pos.accountId,
+            accountName: account.displayName || account.nickname || `Account ${pos.accountId}`,
+            accountType: account.type || account.clientAccountType,
+            shares: pos.openQuantity,
+            avgCost: pos.averageEntryPrice,
+            marketValue: pos.currentMarketValue,
+            totalCost: pos.totalCost,
+            openPnl: pos.openPnl
+          };
+        });
+
+        // Create aggregated position
+        return {
+          symbol,
+          symbolId: positions[0].symbolId, // Same for all positions of this symbol
+          personName: personNames.size === 1 ? Array.from(personNames)[0] : 'Multiple',
+          accountId: 'AGGREGATED',
         
         // Aggregated quantities and values
         openQuantity: totalShares,
@@ -195,10 +216,11 @@ class AccountAggregator {
         // Market data (use latest)
         marketData: latestMarketData,
         
-        // Aggregation metadata
-        isAggregated: true,
-        sourceAccounts,
-        numberOfAccounts: sourceAccounts.length,
+      // Aggregation metadata
+          isAggregated: true,
+          sourceAccounts,
+          numberOfAccounts: sourceAccounts.length,
+          individualPositions,
         
         // Timestamps
         syncedAt: latestSyncedAt,
