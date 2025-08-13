@@ -1,4 +1,4 @@
-// services/accountAggregator.js
+// services/accountAggregator.js - FIXED VERSION
 const Position = require('../models/Position');
 const Activity = require('../models/Activity');
 const Account = require('../models/Account');
@@ -172,6 +172,13 @@ class AccountAggregator {
           };
         });
 
+        // FIXED: Determine if this is actually a dividend stock based on real dividend data
+        // Check both position dividend data AND symbol dividend information
+        const symbolDividendPerShare = symbolInfo?.dividendPerShare || symbolInfo?.dividend || 0;
+        const isDividendStock = totalAnnualDividend > 0 || 
+                               totalDividendsReceived > 0 || 
+                               symbolDividendPerShare > 0;
+
         // Create aggregated position
         return {
           symbol,
@@ -226,11 +233,13 @@ class AccountAggregator {
         syncedAt: latestSyncedAt,
         updatedAt: new Date(),
         
-        // Additional symbol info
+        // Additional symbol info with FIXED dividend logic
         industrySector: symbolInfo?.industrySector,
         industryGroup: symbolInfo?.industryGroup,
         currency: symbolInfo?.currency,
-        isDividendStock: totalAnnualDividend > 0
+        isDividendStock, // FIXED: Use calculated value instead of symbolInfo
+        // FIXED: Only show dividendPerShare if it's actually a dividend stock
+        dividendPerShare: isDividendStock ? (symbolDividendPerShare || 0) : 0
       };
     } catch (error) {
       logger.error(`Error aggregating positions for symbol ${symbol}:`, error);
@@ -352,7 +361,7 @@ class AccountAggregator {
     }
   }
 
-  // Enrich positions with additional symbol information
+  // Enrich positions with additional symbol information - FIXED
   async enrichPositions(positions) {
     try {
       const symbolIds = [...new Set(positions.map(p => p.symbolId))];
@@ -360,15 +369,34 @@ class AccountAggregator {
       const symbolMap = {};
       symbols.forEach(sym => { symbolMap[sym.symbolId] = sym; });
 
-      return positions.map(position => ({
-        ...position,
-        dividendPerShare: symbolMap[position.symbolId]?.dividendPerShare ?? symbolMap[position.symbolId]?.dividend,
-        industrySector: position.industrySector || symbolMap[position.symbolId]?.industrySector,
-        industryGroup: position.industryGroup || symbolMap[position.symbolId]?.industryGroup,
-        industrySubGroup: symbolMap[position.symbolId]?.industrySubGroup,
-        currency: position.currency || symbolMap[position.symbolId]?.currency,
-        securityType: symbolMap[position.symbolId]?.securityType
-      }));
+      return positions.map(position => {
+        const symbolInfo = symbolMap[position.symbolId];
+        const actualDividendData = position.dividendData || {};
+        
+        // Get symbol's dividend information
+        const symbolDividendPerShare = symbolInfo?.dividendPerShare ?? symbolInfo?.dividend ?? 0;
+        
+        // FIXED: Check multiple sources to determine if this is a dividend stock
+        const hasActualDividends = (actualDividendData.annualDividend || 0) > 0 || 
+                                 (actualDividendData.totalReceived || 0) > 0 ||
+                                 symbolDividendPerShare > 0; // Also check symbol data
+        
+        // FIXED: Enhanced logic for isDividendStock - check both position and symbol data
+        const isDividendStock = hasActualDividends;
+        
+        return {
+          ...position,
+          // FIXED: Show dividendPerShare if either position has dividend data OR symbol indicates dividend
+          dividendPerShare: isDividendStock ? symbolDividendPerShare : 0,
+          industrySector: position.industrySector || symbolInfo?.industrySector,
+          industryGroup: position.industryGroup || symbolInfo?.industryGroup,
+          industrySubGroup: symbolInfo?.industrySubGroup,
+          currency: position.currency || symbolInfo?.currency,
+          securityType: symbolInfo?.securityType,
+          // FIXED: Set isDividendStock based on comprehensive dividend check
+          isDividendStock
+        };
+      });
     } catch (error) {
       logger.error('Error enriching positions:', error);
       return positions;
