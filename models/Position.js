@@ -1,4 +1,4 @@
-// models/Position.js
+// models/Position.js - Updated to ensure dividendPerShare is properly stored
 const mongoose = require('mongoose');
 
 const positionSchema = new mongoose.Schema({
@@ -41,20 +41,63 @@ const positionSchema = new mongoose.Schema({
   capitalGainPercent: Number,
   capitalGainValue: Number,
   
+  // IMPORTANT: Store dividendPerShare at position level
+  dividendPerShare: {
+    type: Number,
+    default: 0
+  },
+  
+  // Additional symbol information stored at position level
+  industrySector: String,
+  industryGroup: String,
+  currency: String,
+  securityType: String,
+  isDividendStock: {
+    type: Boolean,
+    default: false
+  },
+  
   // Dividend tracking
   dividendData: {
-    totalReceived: Number,
-    lastDividendAmount: Number,
+    totalReceived: {
+      type: Number,
+      default: 0
+    },
+    lastDividendAmount: {
+      type: Number,
+      default: 0
+    },
     lastDividendDate: Date,
-    dividendReturnPercent: Number,
-    yieldOnCost: Number,
+    dividendReturnPercent: {
+      type: Number,
+      default: 0
+    },
+    yieldOnCost: {
+      type: Number,
+      default: 0
+    },
     dividendAdjustedCost: Number,
     dividendAdjustedCostPerShare: Number,
-    monthlyDividend: Number,
-    monthlyDividendPerShare: Number,
-    annualDividend: Number,
-    annualDividendPerShare: Number,
-    dividendFrequency: Number
+    monthlyDividend: {
+      type: Number,
+      default: 0
+    },
+    monthlyDividendPerShare: {
+      type: Number,
+      default: 0
+    },
+    annualDividend: {
+      type: Number,
+      default: 0
+    },
+    annualDividendPerShare: {
+      type: Number,
+      default: 0
+    },
+    dividendFrequency: {
+      type: Number,
+      default: 0
+    }
   },
   
   // Market data cache
@@ -76,6 +119,17 @@ const positionSchema = new mongoose.Schema({
     default: false
   },
   sourceAccounts: [String], // List of account IDs that contributed to this aggregated position
+  numberOfAccounts: Number,
+  individualPositions: [{
+    accountId: String,
+    accountName: String,
+    accountType: String,
+    shares: Number,
+    avgCost: Number,
+    marketValue: Number,
+    totalCost: Number,
+    openPnl: Number
+  }],
   
   syncedAt: {
     type: Date,
@@ -101,5 +155,7 @@ positionSchema.pre('save', function(next) {
 positionSchema.index({ accountId: 1, symbol: 1 }, { unique: true });
 positionSchema.index({ personName: 1, symbol: 1 });
 positionSchema.index({ personName: 1, accountId: 1 });
+positionSchema.index({ symbol: 1, isDividendStock: 1 });
+positionSchema.index({ isAggregated: 1, personName: 1 });
 
 module.exports = mongoose.model('Position', positionSchema);

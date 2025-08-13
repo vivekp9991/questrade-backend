@@ -1,4 +1,4 @@
-// services/accountAggregator.js - FIXED VERSION
+// services/accountAggregator.js - FIXED VERSION - Properly handles dividendPerShare
 const Position = require('../models/Position');
 const Activity = require('../models/Activity');
 const Account = require('../models/Account');
@@ -38,7 +38,7 @@ class AccountAggregator {
         return [];
       }
 
-      // If single account view, return positions as-is
+      // If single account view, return positions as-is but enriched
       if (viewMode === 'account') {
         return await this.enrichPositions(positions);
       }
@@ -65,8 +65,9 @@ class AccountAggregator {
       
       for (const [symbol, positions] of Object.entries(symbolGroups)) {
         if (positions.length === 1) {
-          // Single position, no aggregation needed
-          aggregatedPositions.push(positions[0]);
+          // Single position, no aggregation needed - but still enrich
+          const enriched = await this.enrichPositions([positions[0]]);
+          aggregatedPositions.push(enriched[0]);
         } else {
           // Multiple positions for same symbol, aggregate them
           const aggregated = await this.aggregateSymbolPositions(symbol, positions, accountMap);
@@ -74,7 +75,7 @@ class AccountAggregator {
         }
       }
 
-      return await this.enrichPositions(aggregatedPositions);
+      return aggregatedPositions;
     } catch (error) {
       logger.error('Error aggregating positions:', error);
       throw error;
@@ -103,6 +104,9 @@ class AccountAggregator {
       let latestMarketData = null;
       let latestSyncedAt = null;
 
+      // FIXED: Track dividend per share from positions (use the most common/recent value)
+      const dividendPerShareValues = [];
+
       // Aggregate values from all positions
       positions.forEach(position => {
         totalShares += position.openQuantity || 0;
@@ -127,6 +131,11 @@ class AccountAggregator {
           totalMonthlyDividend += position.dividendData.monthlyDividend || 0;
           totalAnnualDividend += position.dividendData.annualDividend || 0;
         }
+
+        // FIXED: Collect dividendPerShare values from positions
+        if (position.dividendPerShare && position.dividendPerShare > 0) {
+          dividendPerShareValues.push(position.dividendPerShare);
+        }
       });
 
       // Calculate aggregated metrics
@@ -140,12 +149,35 @@ class AccountAggregator {
       const yieldOnCost = weightedAverageCost > 0 && totalShares > 0
         ? ((totalAnnualDividend / totalShares) / weightedAverageCost) * 100
         : 0;
-      const currentYield = latestPrice > 0 && totalShares > 0
-        ? ((totalAnnualDividend / totalShares) / latestPrice) * 100
-        : 0;
-       // When no dividends have been received, keep original cost values
-      // rather than subtracting zero or returning confusing numbers.
-      // If dividends exist, adjust the cost accordingly.
+
+      // FIXED: Calculate dividendPerShare more intelligently
+      let aggregatedDividendPerShare = 0;
+      
+      // First, try to use values from positions
+      if (dividendPerShareValues.length > 0) {
+        // Use the most common value, or if tied, the highest value
+        const valueCount = {};
+        dividendPerShareValues.forEach(val => {
+          valueCount[val] = (valueCount[val] || 0) + 1;
+        });
+        
+        // Get the most frequent value
+        const sortedValues = Object.entries(valueCount)
+          .sort((a, b) => {
+            // Sort by frequency first, then by value (descending)
+            if (b[1] !== a[1]) return b[1] - a[1];
+            return parseFloat(b[0]) - parseFloat(a[0]);
+          });
+        
+        aggregatedDividendPerShare = parseFloat(sortedValues[0][0]);
+      }
+      
+      // If no dividendPerShare from positions, try symbol data
+      if (aggregatedDividendPerShare === 0 && symbolInfo) {
+        aggregatedDividendPerShare = symbolInfo.dividendPerShare || symbolInfo.dividend || 0;
+      }
+
+      // When no dividends have been received, keep original cost values
       let dividendAdjustedCostPerShare;
       let dividendAdjustedCost;
 
@@ -157,35 +189,33 @@ class AccountAggregator {
         dividendAdjustedCost = totalCost > 0 ? totalCost : null;
       }
 
-          // Map each account's individual position for client display
-        const individualPositions = positions.map(pos => {
-          const account = accountMap[pos.accountId] || {};
-          return {
-            accountId: pos.accountId,
-            accountName: account.displayName || account.nickname || `Account ${pos.accountId}`,
-            accountType: account.type || account.clientAccountType,
-            shares: pos.openQuantity,
-            avgCost: pos.averageEntryPrice,
-            marketValue: pos.currentMarketValue,
-            totalCost: pos.totalCost,
-            openPnl: pos.openPnl
-          };
-        });
-
-        // FIXED: Determine if this is actually a dividend stock based on real dividend data
-        // Check both position dividend data AND symbol dividend information
-        const symbolDividendPerShare = symbolInfo?.dividendPerShare || symbolInfo?.dividend || 0;
-        const isDividendStock = totalAnnualDividend > 0 || 
-                               totalDividendsReceived > 0 || 
-                               symbolDividendPerShare > 0;
-
-        // Create aggregated position
+      // Map each account's individual position for client display
+      const individualPositions = positions.map(pos => {
+        const account = accountMap[pos.accountId] || {};
         return {
-          symbol,
-          symbolId: positions[0].symbolId, // Same for all positions of this symbol
-          personName: personNames.size === 1 ? Array.from(personNames)[0] : 'Multiple',
-          accountId: 'AGGREGATED',
-        
+          accountId: pos.accountId,
+          accountName: account.displayName || account.nickname || `Account ${pos.accountId}`,
+          accountType: account.type || account.clientAccountType,
+          shares: pos.openQuantity,
+          avgCost: pos.averageEntryPrice,
+          marketValue: pos.currentMarketValue,
+          totalCost: pos.totalCost,
+          openPnl: pos.openPnl
+        };
+      });
+
+      // FIXED: Determine if this is actually a dividend stock based on real dividend data
+      const isDividendStock = totalAnnualDividend > 0 || 
+                             totalDividendsReceived > 0 || 
+                             aggregatedDividendPerShare > 0;
+
+      // Create aggregated position
+      const aggregatedPosition = {
+        symbol,
+        symbolId: positions[0].symbolId, // Same for all positions of this symbol
+        personName: personNames.size === 1 ? Array.from(personNames)[0] : 'Multiple',
+        accountId: 'AGGREGATED',
+      
         // Aggregated quantities and values
         openQuantity: totalShares,
         closedQuantity: 0,
@@ -223,24 +253,26 @@ class AccountAggregator {
         // Market data (use latest)
         marketData: latestMarketData,
         
-      // Aggregation metadata
-          isAggregated: true,
-          sourceAccounts,
-          numberOfAccounts: sourceAccounts.length,
-          individualPositions,
+        // Aggregation metadata
+        isAggregated: true,
+        sourceAccounts,
+        numberOfAccounts: sourceAccounts.length,
+        individualPositions,
         
         // Timestamps
         syncedAt: latestSyncedAt,
         updatedAt: new Date(),
         
-        // Additional symbol info with FIXED dividend logic
+        // FIXED: Use properly calculated dividend per share
+        dividendPerShare: aggregatedDividendPerShare,
         industrySector: symbolInfo?.industrySector,
         industryGroup: symbolInfo?.industryGroup,
-        currency: symbolInfo?.currency,
-        isDividendStock, // FIXED: Use calculated value instead of symbolInfo
-        // FIXED: Only show dividendPerShare if it's actually a dividend stock
-        dividendPerShare: isDividendStock ? (symbolDividendPerShare || 0) : 0
+        currency: symbolInfo?.currency || positions[0]?.currency,
+        securityType: symbolInfo?.securityType,
+        isDividendStock
       };
+
+      return aggregatedPosition;
     } catch (error) {
       logger.error(`Error aggregating positions for symbol ${symbol}:`, error);
       throw error;
@@ -373,27 +405,31 @@ class AccountAggregator {
         const symbolInfo = symbolMap[position.symbolId];
         const actualDividendData = position.dividendData || {};
         
-        // Get symbol's dividend information
-        const symbolDividendPerShare = symbolInfo?.dividendPerShare ?? symbolInfo?.dividend ?? 0;
+        // FIXED: Prioritize existing dividendPerShare from position data
+        let dividendPerShare = position.dividendPerShare || 0;
         
-        // FIXED: Check multiple sources to determine if this is a dividend stock
+        // If position doesn't have dividendPerShare, try symbol data
+        if (dividendPerShare === 0 && symbolInfo) {
+          dividendPerShare = symbolInfo.dividendPerShare || symbolInfo.dividend || 0;
+        }
+        
+        // Check multiple sources to determine if this is a dividend stock
         const hasActualDividends = (actualDividendData.annualDividend || 0) > 0 || 
                                  (actualDividendData.totalReceived || 0) > 0 ||
-                                 symbolDividendPerShare > 0; // Also check symbol data
+                                 dividendPerShare > 0;
         
-        // FIXED: Enhanced logic for isDividendStock - check both position and symbol data
+        // Enhanced logic for isDividendStock
         const isDividendStock = hasActualDividends;
         
         return {
           ...position,
-          // FIXED: Show dividendPerShare if either position has dividend data OR symbol indicates dividend
-          dividendPerShare: isDividendStock ? symbolDividendPerShare : 0,
+          // FIXED: Always preserve the calculated dividendPerShare value
+          dividendPerShare: isDividendStock ? dividendPerShare : 0,
           industrySector: position.industrySector || symbolInfo?.industrySector,
           industryGroup: position.industryGroup || symbolInfo?.industryGroup,
           industrySubGroup: symbolInfo?.industrySubGroup,
           currency: position.currency || symbolInfo?.currency,
           securityType: symbolInfo?.securityType,
-          // FIXED: Set isDividendStock based on comprehensive dividend check
           isDividendStock
         };
       });

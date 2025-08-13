@@ -1,39 +1,50 @@
-const { PortfolioSnapshot } = require('../../models');
+// services/dataSync/snapshotCreator.js - Portfolio Snapshot Creation
+const PortfolioSnapshot = require('../../models/PortfolioSnapshot');
+const Position = require('../../models/Position');
+const Account = require('../../models/Account');
 const logger = require('../../utils/logger');
 
 class SnapshotCreator {
-  constructor(userId) {
-    this.userId = userId;
+  constructor() {
+    // No constructor parameters needed for the new design
   }
 
   /**
-   * Create a complete portfolio snapshot
+   * Create a complete portfolio snapshot for a person
    */
-  async createSnapshot(accounts, positions) {
+  async createPortfolioSnapshot(personName) {
     try {
-      logger.info(`Creating portfolio snapshot for user ${this.userId}`);
+      logger.info(`Creating portfolio snapshot for person ${personName}`);
+
+      const positions = await Position.find({ personName }).lean();
+      const accounts = await Account.find({ personName }).lean();
 
       const snapshotData = this.calculateSnapshotMetrics(accounts, positions);
       
       const snapshot = await PortfolioSnapshot.create({
-        userId: this.userId,
-        totalValue: snapshotData.totalValue,
-        totalCash: snapshotData.totalCash,
-        totalEquity: snapshotData.totalEquity,
-        totalGainLoss: snapshotData.totalGainLoss,
-        totalGainLossPercent: snapshotData.totalGainLossPercent,
-        accountsCount: snapshotData.accountsCount,
-        positionsCount: snapshotData.positionsCount,
-        topHoldings: snapshotData.topHoldings,
+        personName,
+        viewMode: 'person',
+        date: new Date(),
+        totalInvestment: snapshotData.totalInvestment,
+        currentValue: snapshotData.currentValue,
+        totalReturnValue: snapshotData.totalReturnValue,
+        totalReturnPercent: snapshotData.totalReturnPercent,
+        unrealizedPnl: snapshotData.unrealizedPnl,
+        totalDividends: snapshotData.totalDividends,
+        numberOfPositions: snapshotData.numberOfPositions,
+        numberOfAccounts: snapshotData.numberOfAccounts,
+        numberOfDividendStocks: snapshotData.numberOfDividendStocks,
+        assetAllocation: snapshotData.assetAllocation,
         sectorAllocation: snapshotData.sectorAllocation,
+        currencyBreakdown: snapshotData.currencyBreakdown,
         createdAt: new Date()
       });
 
-      logger.info(`Portfolio snapshot created with ID: ${snapshot.id}`);
+      logger.info(`Portfolio snapshot created with ID: ${snapshot._id} for ${personName}`);
       return snapshot;
 
     } catch (error) {
-      logger.error('Error creating portfolio snapshot:', error);
+      logger.error(`Error creating portfolio snapshot for ${personName}:`, error);
       throw error;
     }
   }
@@ -43,90 +54,53 @@ class SnapshotCreator {
    */
   calculateSnapshotMetrics(accounts, positions) {
     const metrics = {
-      totalValue: 0,
-      totalCash: 0,
-      totalEquity: 0,
-      totalGainLoss: 0,
-      totalGainLossPercent: 0,
-      accountsCount: accounts.length,
-      positionsCount: positions.length,
-      topHoldings: [],
-      sectorAllocation: {}
+      totalInvestment: 0,
+      currentValue: 0,
+      unrealizedPnl: 0,
+      totalDividends: 0,
+      totalReturnValue: 0,
+      totalReturnPercent: 0,
+      numberOfAccounts: accounts.length,
+      numberOfPositions: positions.length,
+      numberOfDividendStocks: 0,
+      assetAllocation: [],
+      sectorAllocation: [],
+      currencyBreakdown: []
     };
 
-    // Calculate totals from accounts
-    accounts.forEach(account => {
-      metrics.totalValue += parseFloat(account.totalValue || 0);
-      metrics.totalCash += parseFloat(account.cashBalance || 0);
-      metrics.totalEquity += parseFloat(account.totalEquity || 0);
-    });
+    // Calculate totals from positions
+    positions.forEach(position => {
+      metrics.totalInvestment += position.totalCost || 0;
+      metrics.currentValue += position.currentMarketValue || 0;
+      metrics.unrealizedPnl += position.openPnl || 0;
+      
+      if (position.dividendData) {
+        metrics.totalDividends += position.dividendData.totalReceived || 0;
+      }
 
-    // Calculate position metrics
-    const positionsBySymbol = this.groupPositionsBySymbol(positions);
-    const holdingsData = [];
-
-    Object.entries(positionsBySymbol).forEach(([symbol, symbolPositions]) => {
-      const totalShares = symbolPositions.reduce((sum, pos) => sum + parseFloat(pos.quantity || 0), 0);
-      const totalValue = symbolPositions.reduce((sum, pos) => sum + parseFloat(pos.marketValue || 0), 0);
-      const totalCostBasis = symbolPositions.reduce((sum, pos) => sum + parseFloat(pos.costBasis || 0), 0);
-      const gainLoss = totalValue - totalCostBasis;
-
-      if (totalShares > 0) {
-        holdingsData.push({
-          symbol,
-          quantity: totalShares,
-          marketValue: totalValue,
-          costBasis: totalCostBasis,
-          gainLoss,
-          gainLossPercent: totalCostBasis > 0 ? (gainLoss / totalCostBasis) * 100 : 0,
-          weight: metrics.totalEquity > 0 ? (totalValue / metrics.totalEquity) * 100 : 0
-        });
-
-        metrics.totalGainLoss += gainLoss;
+      // Count dividend stocks
+      if (position.dividendData && position.dividendData.annualDividend > 0) {
+        metrics.numberOfDividendStocks++;
       }
     });
 
-    // Calculate overall gain/loss percentage
-    const totalCostBasis = holdingsData.reduce((sum, holding) => sum + holding.costBasis, 0);
-    metrics.totalGainLossPercent = totalCostBasis > 0 ? (metrics.totalGainLoss / totalCostBasis) * 100 : 0;
+    // Calculate return metrics
+    metrics.totalReturnValue = metrics.unrealizedPnl + metrics.totalDividends;
+    metrics.totalReturnPercent = metrics.totalInvestment > 0 ? 
+      (metrics.totalReturnValue / metrics.totalInvestment) * 100 : 0;
 
-    // Get top 10 holdings by market value
-    metrics.topHoldings = holdingsData
-      .sort((a, b) => b.marketValue - a.marketValue)
-      .slice(0, 10)
-      .map(holding => ({
-        symbol: holding.symbol,
-        marketValue: holding.marketValue,
-        weight: holding.weight,
-        gainLossPercent: holding.gainLossPercent
-      }));
-
-    // Calculate sector allocation (simplified - you might want to integrate with a sector mapping service)
-    metrics.sectorAllocation = this.calculateSectorAllocation(holdingsData);
+    // Calculate allocations
+    metrics.sectorAllocation = this.calculateSectorAllocation(positions, metrics.currentValue);
+    metrics.currencyBreakdown = this.calculateCurrencyBreakdown(positions, metrics.currentValue);
+    metrics.assetAllocation = this.calculateAssetAllocation(positions, metrics.currentValue);
 
     return metrics;
   }
 
   /**
-   * Group positions by symbol across all accounts
-   */
-  groupPositionsBySymbol(positions) {
-    return positions.reduce((grouped, position) => {
-      const symbol = position.symbol;
-      if (!grouped[symbol]) {
-        grouped[symbol] = [];
-      }
-      grouped[symbol].push(position);
-      return grouped;
-    }, {});
-  }
-
-  /**
    * Calculate sector allocation
-   * Note: This is a simplified implementation. In production, you'd want to
-   * integrate with a data provider that maps symbols to sectors.
    */
-  calculateSectorAllocation(holdingsData) {
+  calculateSectorAllocation(positions, totalValue) {
     const sectorMap = {
       // Technology
       'AAPL': 'Technology', 'MSFT': 'Technology', 'GOOGL': 'Technology', 'GOOG': 'Technology',
@@ -137,59 +111,127 @@ class SnapshotCreator {
       
       // Financial
       'JPM': 'Financial', 'BAC': 'Financial', 'WFC': 'Financial', 'GS': 'Financial',
-      'MS': 'Financial', 'C': 'Financial',
+      'MS': 'Financial', 'C': 'Financial', 'RY': 'Financial', 'TD': 'Financial',
       
       // Consumer
       'WMT': 'Consumer Discretionary', 'HD': 'Consumer Discretionary', 'MCD': 'Consumer Discretionary',
       'COST': 'Consumer Staples', 'PG': 'Consumer Staples', 'KO': 'Consumer Staples',
       
       // Energy
-      'XOM': 'Energy', 'CVX': 'Energy', 'COP': 'Energy',
+      'XOM': 'Energy', 'CVX': 'Energy', 'COP': 'Energy', 'ENB': 'Energy',
       
       // Utilities
-      'NEE': 'Utilities', 'DUK': 'Utilities', 'SO': 'Utilities'
+      'NEE': 'Utilities', 'DUK': 'Utilities', 'SO': 'Utilities',
+      
+      // Real Estate & REITs
+      'REI': 'Real Estate', 'VNQ': 'Real Estate'
     };
 
     const sectorTotals = {};
-    let totalValue = holdingsData.reduce((sum, holding) => sum + holding.marketValue, 0);
 
-    holdingsData.forEach(holding => {
-      const sector = sectorMap[holding.symbol] || 'Other';
-      if (!sectorTotals[sector]) {
-        sectorTotals[sector] = 0;
+    positions.forEach(position => {
+      const sector = position.industrySector || 
+                    sectorMap[position.symbol] || 
+                    (position.symbol && position.symbol.includes('.TO') ? 'Canadian Equity' : 'Other');
+      
+      const value = position.currentMarketValue || 0;
+      sectorTotals[sector] = (sectorTotals[sector] || 0) + value;
+    });
+
+    // Convert to array format with percentages
+    return Object.entries(sectorTotals)
+      .map(([sector, value]) => ({
+        sector,
+        value,
+        percentage: totalValue > 0 ? (value / totalValue) * 100 : 0
+      }))
+      .filter(item => item.percentage > 0.5) // Only include sectors > 0.5%
+      .sort((a, b) => b.value - a.value);
+  }
+
+  /**
+   * Calculate currency breakdown
+   */
+  calculateCurrencyBreakdown(positions, totalValue) {
+    const currencyTotals = {};
+
+    positions.forEach(position => {
+      const currency = position.currency || 
+                      (position.symbol && position.symbol.includes('.TO') ? 'CAD' : 'USD');
+      
+      const value = position.currentMarketValue || 0;
+      currencyTotals[currency] = (currencyTotals[currency] || 0) + value;
+    });
+
+    return Object.entries(currencyTotals)
+      .map(([currency, value]) => ({
+        currency,
+        value,
+        percentage: totalValue > 0 ? (value / totalValue) * 100 : 0
+      }))
+      .sort((a, b) => b.value - a.value);
+  }
+
+  /**
+   * Calculate asset allocation (stocks vs bonds vs other)
+   */
+  calculateAssetAllocation(positions, totalValue) {
+    const assetTotals = {
+      'Stocks': 0,
+      'ETFs': 0,
+      'Bonds': 0,
+      'Other': 0
+    };
+
+    positions.forEach(position => {
+      const value = position.currentMarketValue || 0;
+      const symbol = position.symbol || '';
+      
+      // Simple classification based on symbol patterns
+      if (symbol.includes('ETF') || symbol.includes('.TO') && symbol.length <= 6) {
+        assetTotals['ETFs'] += value;
+      } else if (symbol.includes('BOND') || symbol.includes('TDB')) {
+        assetTotals['Bonds'] += value;
+      } else if (position.securityType === 'Stock') {
+        assetTotals['Stocks'] += value;
+      } else {
+        assetTotals['Other'] += value;
       }
-      sectorTotals[sector] += holding.marketValue;
     });
 
-    // Convert to percentages
-    const sectorAllocation = {};
-    Object.entries(sectorTotals).forEach(([sector, value]) => {
-      sectorAllocation[sector] = totalValue > 0 ? (value / totalValue) * 100 : 0;
-    });
-
-    return sectorAllocation;
+    return Object.entries(assetTotals)
+      .map(([category, value]) => ({
+        category,
+        value,
+        percentage: totalValue > 0 ? (value / totalValue) * 100 : 0
+      }))
+      .filter(item => item.value > 0)
+      .sort((a, b) => b.value - a.value);
   }
 
   /**
    * Create a lightweight snapshot for quick access
    */
-  async createLightSnapshot(accounts, positions) {
+  async createLightSnapshot(personName) {
     try {
-      const totalValue = accounts.reduce((sum, acc) => sum + parseFloat(acc.totalValue || 0), 0);
-      const totalCash = accounts.reduce((sum, acc) => sum + parseFloat(acc.cashBalance || 0), 0);
+      const positions = await Position.find({ personName });
+      const accounts = await Account.find({ personName });
+      
+      const totalValue = positions.reduce((sum, pos) => sum + (pos.currentMarketValue || 0), 0);
+      const totalCost = positions.reduce((sum, pos) => sum + (pos.totalCost || 0), 0);
       const positionsCount = positions.length;
 
       return {
-        userId: this.userId,
+        personName,
         totalValue,
-        totalCash,
+        totalCost,
         accountsCount: accounts.length,
         positionsCount,
         timestamp: new Date()
       };
 
     } catch (error) {
-      logger.error('Error creating light snapshot:', error);
+      logger.error(`Error creating light snapshot for ${personName}:`, error);
       throw error;
     }
   }
@@ -197,14 +239,14 @@ class SnapshotCreator {
   /**
    * Get the latest snapshot for comparison
    */
-  async getLatestSnapshot() {
+  async getLatestSnapshot(personName) {
     try {
       return await PortfolioSnapshot.findOne({
-        where: { userId: this.userId },
-        order: [['createdAt', 'DESC']]
-      });
+        personName,
+        viewMode: 'person'
+      }).sort({ createdAt: -1 });
     } catch (error) {
-      logger.error('Error fetching latest snapshot:', error);
+      logger.error(`Error fetching latest snapshot for ${personName}:`, error);
       return null;
     }
   }
@@ -212,27 +254,42 @@ class SnapshotCreator {
   /**
    * Clean old snapshots (keep only last 30 days)
    */
-  async cleanOldSnapshots() {
+  async cleanOldSnapshots(personName) {
     try {
       const thirtyDaysAgo = new Date();
       thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
 
-      const deletedCount = await PortfolioSnapshot.destroy({
-        where: {
-          userId: this.userId,
-          createdAt: {
-            [require('sequelize').Op.lt]: thirtyDaysAgo
-          }
-        }
+      const deleteResult = await PortfolioSnapshot.deleteMany({
+        personName,
+        createdAt: { $lt: thirtyDaysAgo }
       });
 
-      if (deletedCount > 0) {
-        logger.info(`Cleaned up ${deletedCount} old snapshots for user ${this.userId}`);
+      if (deleteResult.deletedCount > 0) {
+        logger.info(`Cleaned up ${deleteResult.deletedCount} old snapshots for ${personName}`);
       }
 
-      return deletedCount;
+      return deleteResult.deletedCount;
     } catch (error) {
-      logger.error('Error cleaning old snapshots:', error);
+      logger.error(`Error cleaning old snapshots for ${personName}:`, error);
+      throw error;
+    }
+  }
+
+  /**
+   * Get snapshot history for a person
+   */
+  async getSnapshotHistory(personName, days = 30) {
+    try {
+      const startDate = new Date();
+      startDate.setDate(startDate.getDate() - days);
+
+      return await PortfolioSnapshot.find({
+        personName,
+        viewMode: 'person',
+        date: { $gte: startDate }
+      }).sort({ date: -1 });
+    } catch (error) {
+      logger.error(`Error getting snapshot history for ${personName}:`, error);
       throw error;
     }
   }
