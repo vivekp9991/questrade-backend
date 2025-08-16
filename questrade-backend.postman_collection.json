@@ -217,6 +217,13 @@
             "method": "GET",
             "url": "{{base_url}}/api/portfolio/snapshots?viewMode=all&limit=10"
           }
+        },
+        {
+          "name": "Cash balances (all accounts)",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/portfolio/cash-balances?viewMode=all"
+          }
         }
       ]
     },
@@ -257,6 +264,13 @@
             "method": "GET",
             "url": "{{base_url}}/api/portfolio/snapshots?viewMode=person&personName={{person_name}}&limit=5"
           }
+        },
+        {
+          "name": "Cash balances (person)",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/portfolio/cash-balances?viewMode=person&personName={{person_name}}"
+          }
         }
       ]
     },
@@ -292,6 +306,13 @@
           }
         },
         {
+          "name": "Cash balances (specific account)",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/portfolio/cash-balances?viewMode=account&accountId={{account_id}}"
+          }
+        },
+        {
           "name": "Get position details by symbol",
           "request": {
             "method": "GET",
@@ -303,6 +324,39 @@
           "request": {
             "method": "GET",
             "url": "{{base_url}}/api/portfolio/positions/GLD?accountId={{account_id}}"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Cash Balances",
+      "item": [
+        {
+          "name": "Get all cash balances",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/portfolio/cash-balances"
+          }
+        },
+        {
+          "name": "Get cash balances by person",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/portfolio/cash-balances?viewMode=person&personName={{person_name}}"
+          }
+        },
+        {
+          "name": "Get cash balance for specific account",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/portfolio/cash-balances?viewMode=account&accountId={{account_id}}"
+          }
+        },
+        {
+          "name": "Get cash balances with currency filter",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/portfolio/cash-balances?viewMode=all&currency=CAD"
           }
         }
       ]
@@ -624,6 +678,13 @@
                 "method": "GET",
                 "url": "{{base_url}}/api/portfolio/summary?viewMode=all&aggregate=true"
               }
+            },
+            {
+              "name": "5. Test Cash Balances All",
+              "request": {
+                "method": "GET",
+                "url": "{{base_url}}/api/portfolio/cash-balances?viewMode=all"
+              }
             }
           ]
         },
@@ -657,6 +718,13 @@
                 "method": "GET",
                 "url": "{{base_url}}/api/portfolio/positions?viewMode=person&personName=Vicky&aggregate=false"
               }
+            },
+            {
+              "name": "5. Test Cash Balances by Person",
+              "request": {
+                "method": "GET",
+                "url": "{{base_url}}/api/portfolio/cash-balances?viewMode=person&personName=Vicky"
+              }
             }
           ]
         },
@@ -689,6 +757,46 @@
               "request": {
                 "method": "GET",
                 "url": "{{base_url}}/api/portfolio/summary?viewMode=person"
+              }
+            },
+            {
+              "name": "4. Cash Balances Invalid Account",
+              "request": {
+                "method": "GET",
+                "url": "{{base_url}}/api/portfolio/cash-balances?viewMode=account&accountId=invalid123"
+              }
+            }
+          ]
+        },
+        {
+          "name": "Test Currency Features",
+          "item": [
+            {
+              "name": "1. Cash Balances All Currencies",
+              "request": {
+                "method": "GET",
+                "url": "{{base_url}}/api/portfolio/cash-balances?viewMode=all"
+              }
+            },
+            {
+              "name": "2. Portfolio Summary with Currency",
+              "request": {
+                "method": "GET",
+                "url": "{{base_url}}/api/portfolio/summary?viewMode=all&aggregate=true"
+              }
+            },
+            {
+              "name": "3. Positions with Currency Info",
+              "request": {
+                "method": "GET",
+                "url": "{{base_url}}/api/portfolio/positions?viewMode=all&aggregate=true"
+              }
+            },
+            {
+              "name": "4. Dividend Calendar with Currency",
+              "request": {
+                "method": "GET",
+                "url": "{{base_url}}/api/portfolio/dividends/calendar?viewMode=all"
               }
             }
           ]

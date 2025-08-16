@@ -105,70 +105,7 @@ router.get('/positions', asyncHandler(async (req, res) => {
   }
 }));
 
-// Get single position details
-router.get('/positions/:symbol', asyncHandler(async (req, res) => {
-  const { symbol } = req.params;
-  const { viewMode = 'account', personName, accountId } = req.query;
-
-  try {
-    let query = { symbol };
-
-    // Build query based on view mode
-    switch (viewMode) {
-      case 'all':
-        // No additional filters
-        break;
-      case 'person':
-        if (personName) query.personName = personName;
-        break;
-      case 'account':
-        if (accountId) query.accountId = accountId;
-        break;
-    }
-
-    const positions = await Position.find(query).lean();
-
-    if (positions.length === 0) {
-      return res.status(404).json({
-        success: false,
-        error: 'Position not found'
-      });
-    }
-
-    // If multiple positions for same symbol, aggregate them
-    let result;
-    if (positions.length === 1) {
-      result = positions[0];
-    } else {
-      // Use aggregation service for multiple positions
-      const aggregated = await accountAggregator.aggregateSymbolPositions(symbol, positions);
-      result = aggregated;
-    }
-
-    // Enrich with symbol information
-    const symbolInfo = await Symbol.findOne({ symbolId: result.symbolId }).lean();
-    const enrichedPosition = {
-      ...result,
-      dividendPerShare: symbolInfo?.dividendPerShare ?? symbolInfo?.dividend,
-      industrySector: symbolInfo?.industrySector,
-      industryGroup: symbolInfo?.industryGroup,
-      industrySubGroup: symbolInfo?.industrySubGroup
-    };
-
-    res.json({
-      success: true,
-      data: enrichedPosition
-    });
-  } catch (error) {
-    logger.error('Error getting position:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to get position'
-    });
-  }
-}));
-
-// Get dividend calendar with person filtering
+// Get dividend calendar with person filtering and currency information
 router.get('/dividends/calendar', asyncHandler(async (req, res) => {
   const { personName, viewMode, accountId, startDate, endDate } = req.query;
 
@@ -200,11 +137,81 @@ router.get('/dividends/calendar', asyncHandler(async (req, res) => {
 
     const dividends = await Activity.find(query)
       .sort({ transactionDate: -1 })
-      .limit(100);
+      .limit(100)
+      .lean();
+
+    // Get symbol information for currency data
+    const symbolsInDividends = [...new Set(dividends.map(d => d.symbol).filter(Boolean))];
+    const symbols = await Symbol.find({ symbol: { $in: symbolsInDividends } }).lean();
+    const symbolMap = {};
+    symbols.forEach(sym => { symbolMap[sym.symbol] = sym; });
+
+    // Enhance dividends with currency information
+    const enhancedDividends = dividends.map(dividend => {
+      const symbol = symbolMap[dividend.symbol];
+      const currency = symbol?.currency || 
+                      dividend.currency ||
+                      (dividend.symbol?.includes('.TO') ? 'CAD' : 'USD');
+
+      return {
+        ...dividend,
+        currency,
+        amount: dividend.netAmount,
+        dividendPerShare: dividend.dividendPerShare || 
+                         (dividend.quantity > 0 ? Math.abs(dividend.netAmount) / dividend.quantity : 0)
+      };
+    });
+
+    // Calculate currency summary
+    const currencySummary = {};
+    enhancedDividends.forEach(dividend => {
+      const currency = dividend.currency;
+      if (!currencySummary[currency]) {
+        currencySummary[currency] = {
+          currency,
+          totalAmount: 0,
+          count: 0
+        };
+      }
+      currencySummary[currency].totalAmount += Math.abs(dividend.netAmount || 0);
+      currencySummary[currency].count += 1;
+    });
+
+    // Group by month for additional summary
+    const monthlyBreakdown = {};
+    enhancedDividends.forEach(dividend => {
+      const monthKey = dividend.transactionDate.toISOString().substring(0, 7); // YYYY-MM
+      if (!monthlyBreakdown[monthKey]) {
+        monthlyBreakdown[monthKey] = {
+          month: monthKey,
+          currencies: {}
+        };
+      }
+      
+      const currency = dividend.currency;
+      if (!monthlyBreakdown[monthKey].currencies[currency]) {
+        monthlyBreakdown[monthKey].currencies[currency] = {
+          currency,
+          amount: 0,
+          count: 0
+        };
+      }
+      
+      monthlyBreakdown[monthKey].currencies[currency].amount += Math.abs(dividend.netAmount || 0);
+      monthlyBreakdown[monthKey].currencies[currency].count += 1;
+    });
 
     res.json({
       success: true,
-      data: dividends
+      data: enhancedDividends,
+      meta: {
+        viewMode,
+        personName,
+        accountId,
+        count: enhancedDividends.length,
+        currencySummary: Object.values(currencySummary),
+        monthlyBreakdown: Object.values(monthlyBreakdown).sort((a, b) => b.month.localeCompare(a.month))
+      }
     });
   } catch (error) {
     logger.error('Error getting dividend calendar:', error);
@@ -437,6 +444,204 @@ router.get('/sync/status', asyncHandler(async (req, res) => {
     res.status(500).json({
       success: false,
       error: 'Failed to get sync status'
+    });
+  }
+}));
+
+// Get cash balances for all accounts - ADD THIS NEW ENDPOINT
+router.get('/cash-balances', asyncHandler(async (req, res) => {
+  const { personName, accountId, viewMode = 'all' } = req.query;
+
+  try {
+    let accountQuery = {};
+    
+    // Build query based on view mode and filters
+    switch (viewMode) {
+      case 'person':
+        if (personName) accountQuery.personName = personName;
+        break;
+      case 'account':
+        if (accountId) accountQuery.accountId = accountId;
+        break;
+      case 'all':
+      default:
+        // No additional filters
+        break;
+    }
+
+    // Get accounts with balance data
+    const accounts = await Account.find(accountQuery)
+      .sort({ personName: 1, type: 1 })
+      .lean();
+
+    const cashBalanceAccounts = [];
+    const currencyTotals = {};
+    const personSet = new Set();
+
+    for (const account of accounts) {
+      // Extract cash balance from account balances
+      let cashBalance = 0;
+      let currency = 'CAD'; // Default currency
+      
+      if (account.balances && account.balances.combinedBalances) {
+        const balance = account.balances.combinedBalances;
+        cashBalance = balance.cash || 0;
+        currency = balance.currency || 'CAD';
+      }
+
+      // Create account entry
+      const accountEntry = {
+        accountId: account.accountId,
+        accountName: account.displayName || `${account.type} - ${account.accountId}`,
+        accountType: account.type || 'Unknown',
+        personName: account.personName,
+        cashBalance: Number(cashBalance.toFixed(2)),
+        currency: currency,
+        lastUpdated: account.balances?.lastUpdated || account.syncedAt
+      };
+
+      cashBalanceAccounts.push(accountEntry);
+
+      // Track currency totals
+      if (!currencyTotals[currency]) {
+        currencyTotals[currency] = 0;
+      }
+      currencyTotals[currency] += cashBalance;
+
+      // Track unique persons
+      personSet.add(account.personName);
+    }
+
+    // Build summary
+    const summary = {
+      totalAccounts: cashBalanceAccounts.length,
+      totalPersons: personSet.size,
+      ...Object.entries(currencyTotals).reduce((acc, [currency, total]) => {
+        acc[`total${currency}`] = Number(total.toFixed(2));
+        return acc;
+      }, {})
+    };
+
+    // Get the most recent update time
+    const lastUpdated = cashBalanceAccounts.reduce((latest, account) => {
+      const accountTime = new Date(account.lastUpdated || 0);
+      return accountTime > latest ? accountTime : latest;
+    }, new Date(0));
+
+    res.json({
+      success: true,
+      data: {
+        accounts: cashBalanceAccounts,
+        summary,
+        lastUpdated: lastUpdated.toISOString(),
+        viewMode,
+        personName,
+        accountId
+      }
+    });
+
+  } catch (error) {
+    logger.error('Error getting cash balances:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to get cash balances',
+      details: error.message
+    });
+  }
+}));
+
+// Get positions with aggregation support and enhanced currency info
+router.get('/positions', asyncHandler(async (req, res) => {
+  const { viewMode = 'account', personName, accountId, aggregate = 'false' } = req.query;
+
+  try {
+    let accountInfo = null;
+
+    if (aggregate === 'true' || viewMode !== 'account') {
+      // Use aggregation service
+      positions = await accountAggregator.aggregatePositions(viewMode, personName, accountId);
+    } else {
+      // Legacy single account query
+      const query = accountId ? { accountId } : {};
+
+      positions = await Position.find(query)
+        .sort({ currentMarketValue: -1 })
+        .lean();
+
+      // Enrich with symbol data and currency information
+      const symbolIds = positions.map(p => p.symbolId);
+      const symbols = await Symbol.find({ symbolId: { $in: symbolIds } }).lean();
+      const symbolMap = {};
+      symbols.forEach(sym => { symbolMap[sym.symbolId] = sym; });
+
+      positions = positions.map(p => {
+        const sym = symbolMap[p.symbolId];
+        const freq = sym?.dividendFrequency?.toLowerCase();
+        const dividendPerShare = (freq === 'monthly' || freq === 'quarterly')
+          ? (sym?.dividendPerShare ?? sym?.dividend)
+          : 0;
+
+        return {
+          ...p,
+          dividendPerShare,
+          industrySector: sym?.industrySector,
+          industryGroup: sym?.industryGroup,
+          industrySubGroup: sym?.industrySubGroup,
+          currency: sym?.currency || (p.symbol?.includes('.TO') ? 'CAD' : 'USD'), // Enhanced currency detection
+          securityType: sym?.securityType,
+          // Enhanced dividend data with currency
+          dividendData: p.dividendData ? {
+            ...p.dividendData,
+            currency: sym?.currency || (p.symbol?.includes('.TO') ? 'CAD' : 'USD')
+          } : undefined
+        };
+      });
+    }
+
+    if (viewMode === 'account' && accountId) {
+      accountInfo = await Account.findOne({ accountId }).lean();
+      
+      // Add currency info to account
+      if (accountInfo && accountInfo.balances && accountInfo.balances.combinedBalances) {
+        accountInfo.currency = accountInfo.balances.combinedBalances.currency || 'CAD';
+      }
+    }
+
+    // Calculate currency summary for positions
+    const currencySummary = {};
+    positions.forEach(position => {
+      const currency = position.currency || 'CAD';
+      if (!currencySummary[currency]) {
+        currencySummary[currency] = {
+          currency,
+          totalValue: 0,
+          totalCost: 0,
+          positionCount: 0
+        };
+      }
+      currencySummary[currency].totalValue += position.currentMarketValue || 0;
+      currencySummary[currency].totalCost += position.totalCost || 0;
+      currencySummary[currency].positionCount += 1;
+    });
+
+    res.json({
+      success: true,
+      data: positions,
+      meta: {
+        viewMode,
+        personName,
+        accountId,
+        aggregated: aggregate === 'true' || viewMode !== 'account',
+        count: positions.length,
+        currencySummary: Object.values(currencySummary)
+      },
+      account: accountInfo
+    });
+  } catch (error) {
+    logger.error('Error getting positions:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to get positions'
     });
   }
 }));

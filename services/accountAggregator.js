@@ -283,7 +283,7 @@ class AccountAggregator {
     }
   }
 
-  // Get portfolio summary with aggregation
+// Get portfolio summary with aggregation and enhanced currency support
   async getAggregatedSummary(viewMode, personName = null, accountId = null) {
     try {
       const positions = await this.aggregatePositions(viewMode, personName, accountId);
@@ -291,6 +291,23 @@ class AccountAggregator {
       if (positions.length === 0) {
         return null;
       }
+
+      // Get accounts for additional data
+      let accountQuery = {};
+      switch (viewMode) {
+        case 'person':
+          if (personName) accountQuery.personName = personName;
+          break;
+        case 'account':
+          if (accountId) accountQuery.accountId = accountId;
+          break;
+        case 'all':
+        default:
+          // No additional filters
+          break;
+      }
+
+      const accounts = await Account.find(accountQuery).lean();
 
       // Calculate summary metrics
       let totalInvestment = 0;
@@ -354,6 +371,41 @@ class AccountAggregator {
         numberOfPositions: positions.filter(p => p.personName === person).length
       }));
 
+      // Enhanced accounts summary with currency information
+      const accountsSummary = accounts.map(account => {
+        const accountPositions = positions.filter(p => 
+          p.isAggregated ? p.sourceAccounts?.includes(account.accountId) : p.accountId === account.accountId
+        );
+        
+        const accountValue = accountPositions.reduce((sum, p) => sum + (p.currentMarketValue || 0), 0);
+        const accountInvestment = accountPositions.reduce((sum, p) => sum + (p.totalCost || 0), 0);
+        const accountPnl = accountPositions.reduce((sum, p) => sum + (p.openPnl || 0), 0);
+        
+        // Get cash balance and currency from account
+        let cashBalance = 0;
+        let currency = 'CAD';
+        
+        if (account.balances && account.balances.combinedBalances) {
+          const balance = account.balances.combinedBalances;
+          cashBalance = balance.cash || 0;
+          currency = balance.currency || 'CAD';
+        }
+
+        return {
+          accountId: account.accountId,
+          accountName: account.displayName || `${account.type} - ${account.accountId}`,
+          accountType: account.type,
+          currency: currency,
+          totalInvestment: accountInvestment,
+          currentValue: accountValue,
+          unrealizedPnl: accountPnl,
+          cashBalance: cashBalance,
+          numberOfPositions: accountPositions.length,
+          returnPercent: accountInvestment > 0 ? (accountPnl / accountInvestment) * 100 : 0,
+          lastUpdated: account.syncedAt
+        };
+      });
+
       // Get account count
       const accountIds = new Set();
       positions.forEach(position => {
@@ -364,10 +416,14 @@ class AccountAggregator {
         }
       });
 
+      // Determine primary currency (most common currency in positions)
+      const primaryCurrency = Object.entries(currencyMap).sort((a, b) => b[1] - a[1])[0]?.[0] || 'CAD';
+
       return {
         viewMode,
         personName,
         accountId,
+        currency: primaryCurrency,
         totalInvestment,
         currentValue,
         totalReturnValue,
@@ -386,6 +442,7 @@ class AccountAggregator {
         sectorAllocation,
         currencyBreakdown,
         personBreakdown: viewMode === 'all' ? personBreakdown : [],
+        accounts: accountsSummary, // Enhanced accounts array with currency info
         aggregationInfo: {
           hasAggregatedPositions: positions.some(p => p.isAggregated),
           totalAggregatedSymbols: positions.filter(p => p.isAggregated).length
@@ -396,6 +453,7 @@ class AccountAggregator {
       throw error;
     }
   }
+
 
   // Enrich positions with additional symbol information - FIXED
   async enrichPositions(positions) {
