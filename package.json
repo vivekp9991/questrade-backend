@@ -1,6 +1,6 @@
 {
   "name": "portfolio-manager-backend",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "description": "Multi-person portfolio management backend with Questrade integration",
   "main": "server.js",
   "scripts": {
@@ -10,6 +10,8 @@
     "sync": "node scripts/syncData.js",
     "sync:all": "node scripts/syncData.js --all",
     "sync:status": "node scripts/syncData.js --status",
+    "refresh-balances": "node scripts/refreshBalances.js",
+    "refresh-balances:all": "node scripts/refreshBalances.js --all",
     "test": "jest",
     "test:watch": "jest --watch",
     "lint": "eslint .",

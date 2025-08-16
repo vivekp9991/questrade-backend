@@ -1,4 +1,4 @@
-// routes/portfolio.js
+// routes/portfolio.js - FIXED VERSION - Enhanced cash balance endpoint
 const express = require('express');
 const router = express.Router();
 const portfolioCalculator = require('../services/portfolioCalculator');
@@ -58,7 +58,7 @@ router.get('/positions', asyncHandler(async (req, res) => {
         .sort({ currentMarketValue: -1 })
         .lean();
 
-      // Enrich with symbol data
+      // Enrich with symbol data and currency information
       const symbolIds = positions.map(p => p.symbolId);
       const symbols = await Symbol.find({ symbolId: { $in: symbolIds } }).lean();
       const symbolMap = {};
@@ -76,14 +76,44 @@ router.get('/positions', asyncHandler(async (req, res) => {
           dividendPerShare,
           industrySector: sym?.industrySector,
           industryGroup: sym?.industryGroup,
-          industrySubGroup: sym?.industrySubGroup
+          industrySubGroup: sym?.industrySubGroup,
+          currency: sym?.currency || (p.symbol?.includes('.TO') ? 'CAD' : 'USD'), // Enhanced currency detection
+          securityType: sym?.securityType,
+          // Enhanced dividend data with currency
+          dividendData: p.dividendData ? {
+            ...p.dividendData,
+            currency: sym?.currency || (p.symbol?.includes('.TO') ? 'CAD' : 'USD')
+          } : undefined
         };
       });
     }
 
     if (viewMode === 'account' && accountId) {
       accountInfo = await Account.findOne({ accountId }).lean();
+      
+      // Add currency info to account
+      if (accountInfo && accountInfo.balances && accountInfo.balances.combinedBalances) {
+        accountInfo.currency = accountInfo.balances.combinedBalances.currency || 'CAD';
+      }
     }
+
+    // Calculate currency summary for positions
+    const currencySummary = {};
+    positions.forEach(position => {
+      const currency = position.currency || 'CAD';
+      if (!currencySummary[currency]) {
+        currencySummary[currency] = {
+          currency,
+          totalValue: 0,
+          totalCost: 0,
+          positionCount: 0
+        };
+      }
+      currencySummary[currency].totalValue += position.currentMarketValue || 0;
+      currencySummary[currency].totalCost += position.totalCost || 0;
+      currencySummary[currency].positionCount += 1;
+    });
+
     res.json({
       success: true,
       data: positions,
@@ -92,7 +122,8 @@ router.get('/positions', asyncHandler(async (req, res) => {
         personName,
         accountId,
         aggregated: aggregate === 'true' || viewMode !== 'account',
-        count: positions.length
+        count: positions.length,
+        currencySummary: Object.values(currencySummary)
       },
       account: accountInfo
     });
@@ -101,6 +132,199 @@ router.get('/positions', asyncHandler(async (req, res) => {
     res.status(500).json({
       success: false,
       error: 'Failed to get positions'
+    });
+  }
+}));
+
+// FIXED: Enhanced cash balances endpoint with proper balance extraction
+router.get('/cash-balances', asyncHandler(async (req, res) => {
+  const { personName, accountId, viewMode = 'all' } = req.query;
+
+  try {
+    let accountQuery = {};
+    
+    // Build query based on view mode and filters
+    switch (viewMode) {
+      case 'person':
+        if (personName) accountQuery.personName = personName;
+        break;
+      case 'account':
+        if (accountId) accountQuery.accountId = accountId;
+        break;
+      case 'all':
+      default:
+        // No additional filters
+        break;
+    }
+
+    // Get accounts with balance data
+    const accounts = await Account.find(accountQuery)
+      .sort({ personName: 1, type: 1 })
+      .lean();
+
+    const cashBalanceAccounts = [];
+    const currencyTotals = {};
+    const personSet = new Set();
+
+    for (const account of accounts) {
+      let cashBalances = [];
+      let combinedCashBalance = 0;
+      let primaryCurrency = 'CAD';
+      
+      // FIXED: Extract cash balance from account balances properly
+      if (account.balances) {
+        // Process per-currency balances
+        if (account.balances.perCurrencyBalances && Array.isArray(account.balances.perCurrencyBalances)) {
+          cashBalances = account.balances.perCurrencyBalances.map(balance => ({
+            currency: balance.currency,
+            cash: Number((balance.cash || 0).toFixed(2)),
+            marketValue: Number((balance.marketValue || 0).toFixed(2)),
+            totalEquity: Number((balance.totalEquity || 0).toFixed(2)),
+            isRealTime: balance.isRealTime || false
+          }));
+        }
+
+        // Get combined balance or primary currency balance
+        if (account.balances.combinedBalances) {
+          const cb = account.balances.combinedBalances;
+          combinedCashBalance = cb.cash || 0;
+          primaryCurrency = cb.currency || 'CAD';
+        } else if (cashBalances.length > 0) {
+          // If no combined balance, use the first currency balance or find CAD
+          const primaryBalance = cashBalances.find(b => b.currency === 'CAD') || cashBalances[0];
+          combinedCashBalance = primaryBalance.cash;
+          primaryCurrency = primaryBalance.currency;
+        }
+      }
+
+      // Create account entry with enhanced balance information
+      const accountEntry = {
+        accountId: account.accountId,
+        accountName: account.displayName || `${account.type} - ${account.accountId}`,
+        accountType: account.type || 'Unknown',
+        personName: account.personName,
+        cashBalance: Number(combinedCashBalance.toFixed(2)),
+        currency: primaryCurrency,
+        cashBalances: cashBalances, // ADDED: Include all currency balances
+        lastUpdated: account.balances?.lastUpdated || account.syncedAt,
+        syncError: account.balances?.syncError || null
+      };
+
+      cashBalanceAccounts.push(accountEntry);
+
+      // Track currency totals from all balances
+      cashBalances.forEach(balance => {
+        if (!currencyTotals[balance.currency]) {
+          currencyTotals[balance.currency] = 0;
+        }
+        currencyTotals[balance.currency] += balance.cash;
+      });
+
+      // If no per-currency balances, add the combined balance to totals
+      if (cashBalances.length === 0 && combinedCashBalance !== 0) {
+        if (!currencyTotals[primaryCurrency]) {
+          currencyTotals[primaryCurrency] = 0;
+        }
+        currencyTotals[primaryCurrency] += combinedCashBalance;
+      }
+
+      // Track unique persons
+      personSet.add(account.personName);
+    }
+
+    // FIXED: Build summary with proper currency totals
+    const summary = {
+      totalAccounts: cashBalanceAccounts.length,
+      totalPersons: personSet.size,
+      ...Object.entries(currencyTotals).reduce((acc, [currency, total]) => {
+        acc[`total${currency}`] = Number(total.toFixed(2));
+        return acc;
+      }, {})
+    };
+
+    // Get the most recent update time
+    const lastUpdated = cashBalanceAccounts.reduce((latest, account) => {
+      const accountTime = new Date(account.lastUpdated || 0);
+      return accountTime > latest ? accountTime : latest;
+    }, new Date(0));
+
+    // FIXED: Add additional debug information
+    logger.debug('Cash balances extracted:', {
+      accountCount: cashBalanceAccounts.length,
+      currencyTotals,
+      viewMode,
+      personName,
+      accountId
+    });
+
+    res.json({
+      success: true,
+      data: {
+        accounts: cashBalanceAccounts,
+        summary,
+        currencyBreakdown: Object.entries(currencyTotals).map(([currency, total]) => ({
+          currency,
+          total: Number(total.toFixed(2)),
+          percentage: Object.values(currencyTotals).reduce((sum, val) => sum + val, 0) > 0 
+            ? (total / Object.values(currencyTotals).reduce((sum, val) => sum + val, 0)) * 100 
+            : 0
+        })),
+        lastUpdated: lastUpdated.toISOString(),
+        viewMode,
+        personName,
+        accountId
+      }
+    });
+
+  } catch (error) {
+    logger.error('Error getting cash balances:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to get cash balances',
+      details: error.message
+    });
+  }
+}));
+
+// ADDED: Force refresh cash balances endpoint
+router.post('/cash-balances/refresh', asyncHandler(async (req, res) => {
+  const { personName, accountId } = req.body;
+
+  try {
+    if (!personName) {
+      return res.status(400).json({
+        success: false,
+        error: 'personName is required for balance refresh'
+      });
+    }
+
+    logger.info(`Starting balance refresh for ${personName}${accountId ? ` account ${accountId}` : ''}`);
+
+    // Use the AccountSync service to refresh balances
+    const AccountSync = require('../services/dataSync/accountSync');
+    const accountSync = new AccountSync();
+    
+    let result;
+    if (accountId) {
+      // Refresh specific account
+      result = await accountSync.refreshAccountBalances(personName, accountId);
+    } else {
+      // Refresh all accounts for person
+      result = await accountSync.refreshAllAccountBalances(personName);
+    }
+
+    res.json({
+      success: true,
+      message: `Balance refresh completed for ${personName}`,
+      data: result
+    });
+
+  } catch (error) {
+    logger.error('Error refreshing cash balances:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to refresh cash balances',
+      details: error.message
     });
   }
 }));
@@ -390,6 +614,7 @@ router.get('/sync/status', asyncHandler(async (req, res) => {
 
     if (personName) {
       // Get status for specific person
+      const Person = require('../models/Person');
       const person = await Person.findOne({ personName });
       if (!person) {
         return res.status(404).json({
@@ -413,6 +638,7 @@ router.get('/sync/status', asyncHandler(async (req, res) => {
       };
     } else {
       // Get status for all persons
+      const Person = require('../models/Person');
       const persons = await Person.find({ isActive: true });
       const results = await Promise.all(
         persons.map(async (person) => {
@@ -444,204 +670,6 @@ router.get('/sync/status', asyncHandler(async (req, res) => {
     res.status(500).json({
       success: false,
       error: 'Failed to get sync status'
-    });
-  }
-}));
-
-// Get cash balances for all accounts - ADD THIS NEW ENDPOINT
-router.get('/cash-balances', asyncHandler(async (req, res) => {
-  const { personName, accountId, viewMode = 'all' } = req.query;
-
-  try {
-    let accountQuery = {};
-    
-    // Build query based on view mode and filters
-    switch (viewMode) {
-      case 'person':
-        if (personName) accountQuery.personName = personName;
-        break;
-      case 'account':
-        if (accountId) accountQuery.accountId = accountId;
-        break;
-      case 'all':
-      default:
-        // No additional filters
-        break;
-    }
-
-    // Get accounts with balance data
-    const accounts = await Account.find(accountQuery)
-      .sort({ personName: 1, type: 1 })
-      .lean();
-
-    const cashBalanceAccounts = [];
-    const currencyTotals = {};
-    const personSet = new Set();
-
-    for (const account of accounts) {
-      // Extract cash balance from account balances
-      let cashBalance = 0;
-      let currency = 'CAD'; // Default currency
-      
-      if (account.balances && account.balances.combinedBalances) {
-        const balance = account.balances.combinedBalances;
-        cashBalance = balance.cash || 0;
-        currency = balance.currency || 'CAD';
-      }
-
-      // Create account entry
-      const accountEntry = {
-        accountId: account.accountId,
-        accountName: account.displayName || `${account.type} - ${account.accountId}`,
-        accountType: account.type || 'Unknown',
-        personName: account.personName,
-        cashBalance: Number(cashBalance.toFixed(2)),
-        currency: currency,
-        lastUpdated: account.balances?.lastUpdated || account.syncedAt
-      };
-
-      cashBalanceAccounts.push(accountEntry);
-
-      // Track currency totals
-      if (!currencyTotals[currency]) {
-        currencyTotals[currency] = 0;
-      }
-      currencyTotals[currency] += cashBalance;
-
-      // Track unique persons
-      personSet.add(account.personName);
-    }
-
-    // Build summary
-    const summary = {
-      totalAccounts: cashBalanceAccounts.length,
-      totalPersons: personSet.size,
-      ...Object.entries(currencyTotals).reduce((acc, [currency, total]) => {
-        acc[`total${currency}`] = Number(total.toFixed(2));
-        return acc;
-      }, {})
-    };
-
-    // Get the most recent update time
-    const lastUpdated = cashBalanceAccounts.reduce((latest, account) => {
-      const accountTime = new Date(account.lastUpdated || 0);
-      return accountTime > latest ? accountTime : latest;
-    }, new Date(0));
-
-    res.json({
-      success: true,
-      data: {
-        accounts: cashBalanceAccounts,
-        summary,
-        lastUpdated: lastUpdated.toISOString(),
-        viewMode,
-        personName,
-        accountId
-      }
-    });
-
-  } catch (error) {
-    logger.error('Error getting cash balances:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to get cash balances',
-      details: error.message
-    });
-  }
-}));
-
-// Get positions with aggregation support and enhanced currency info
-router.get('/positions', asyncHandler(async (req, res) => {
-  const { viewMode = 'account', personName, accountId, aggregate = 'false' } = req.query;
-
-  try {
-    let accountInfo = null;
-
-    if (aggregate === 'true' || viewMode !== 'account') {
-      // Use aggregation service
-      positions = await accountAggregator.aggregatePositions(viewMode, personName, accountId);
-    } else {
-      // Legacy single account query
-      const query = accountId ? { accountId } : {};
-
-      positions = await Position.find(query)
-        .sort({ currentMarketValue: -1 })
-        .lean();
-
-      // Enrich with symbol data and currency information
-      const symbolIds = positions.map(p => p.symbolId);
-      const symbols = await Symbol.find({ symbolId: { $in: symbolIds } }).lean();
-      const symbolMap = {};
-      symbols.forEach(sym => { symbolMap[sym.symbolId] = sym; });
-
-      positions = positions.map(p => {
-        const sym = symbolMap[p.symbolId];
-        const freq = sym?.dividendFrequency?.toLowerCase();
-        const dividendPerShare = (freq === 'monthly' || freq === 'quarterly')
-          ? (sym?.dividendPerShare ?? sym?.dividend)
-          : 0;
-
-        return {
-          ...p,
-          dividendPerShare,
-          industrySector: sym?.industrySector,
-          industryGroup: sym?.industryGroup,
-          industrySubGroup: sym?.industrySubGroup,
-          currency: sym?.currency || (p.symbol?.includes('.TO') ? 'CAD' : 'USD'), // Enhanced currency detection
-          securityType: sym?.securityType,
-          // Enhanced dividend data with currency
-          dividendData: p.dividendData ? {
-            ...p.dividendData,
-            currency: sym?.currency || (p.symbol?.includes('.TO') ? 'CAD' : 'USD')
-          } : undefined
-        };
-      });
-    }
-
-    if (viewMode === 'account' && accountId) {
-      accountInfo = await Account.findOne({ accountId }).lean();
-      
-      // Add currency info to account
-      if (accountInfo && accountInfo.balances && accountInfo.balances.combinedBalances) {
-        accountInfo.currency = accountInfo.balances.combinedBalances.currency || 'CAD';
-      }
-    }
-
-    // Calculate currency summary for positions
-    const currencySummary = {};
-    positions.forEach(position => {
-      const currency = position.currency || 'CAD';
-      if (!currencySummary[currency]) {
-        currencySummary[currency] = {
-          currency,
-          totalValue: 0,
-          totalCost: 0,
-          positionCount: 0
-        };
-      }
-      currencySummary[currency].totalValue += position.currentMarketValue || 0;
-      currencySummary[currency].totalCost += position.totalCost || 0;
-      currencySummary[currency].positionCount += 1;
-    });
-
-    res.json({
-      success: true,
-      data: positions,
-      meta: {
-        viewMode,
-        personName,
-        accountId,
-        aggregated: aggregate === 'true' || viewMode !== 'account',
-        count: positions.length,
-        currencySummary: Object.values(currencySummary)
-      },
-      account: accountInfo
-    });
-  } catch (error) {
-    logger.error('Error getting positions:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to get positions'
     });
   }
 }));

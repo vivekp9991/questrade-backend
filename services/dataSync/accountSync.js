@@ -1,4 +1,4 @@
-// services/dataSync/accountSync.js - Account Synchronization
+// services/dataSync/accountSync.js - FIXED VERSION - Properly extracts cash balances
 const questradeApi = require('../questradeApi');
 const Account = require('../../models/Account');
 const SyncUtils = require('./syncUtils');
@@ -64,7 +64,7 @@ class AccountSync {
   }
 
   /**
-   * Sync a single account with balance information
+   * Sync a single account with balance information - FIXED VERSION
    */
   async syncSingleAccount(accountData, personName) {
     const accountDoc = {
@@ -80,35 +80,188 @@ class AccountSync {
       updatedAt: new Date()
     };
 
-    // Fetch and store account balances
+    // FIXED: Fetch and properly store account balances
     try {
       const balancesData = await questradeApi.getAccountBalances(accountData.number, personName);
+      
       if (balancesData) {
-        accountDoc.balances = {
+        logger.debug(`Raw balance data for account ${accountData.number}:`, {
+          perCurrencyBalances: balancesData.perCurrencyBalances,
+          combinedBalances: balancesData.combinedBalances
+        });
+
+        // FIXED: Properly extract cash balances from perCurrencyBalances array
+        const processedBalances = {
           perCurrencyBalances: balancesData.perCurrencyBalances || [],
-          combinedBalances: balancesData.combinedBalances || {},
           lastUpdated: new Date()
         };
 
-        // Log balance information
-        if (balancesData.combinedBalances && balancesData.combinedBalances.length > 0) {
-          const primaryBalance = balancesData.combinedBalances[0];
-          logger.debug(`Account ${accountData.number} balance: ${primaryBalance.currency} $${primaryBalance.totalEquity}`);
+        // FIXED: Process combinedBalances correctly
+        // Questrade sometimes returns combinedBalances as an array, sometimes as object
+        let combinedBalances = {};
+        
+        if (balancesData.combinedBalances) {
+          if (Array.isArray(balancesData.combinedBalances) && balancesData.combinedBalances.length > 0) {
+            // If it's an array, take the first element
+            combinedBalances = balancesData.combinedBalances[0];
+          } else if (typeof balancesData.combinedBalances === 'object' && !Array.isArray(balancesData.combinedBalances)) {
+            // If it's already an object, use it directly
+            combinedBalances = balancesData.combinedBalances;
+          }
+        }
+
+        // FIXED: If no combinedBalances, calculate from perCurrencyBalances
+        if (!combinedBalances.currency && balancesData.perCurrencyBalances && balancesData.perCurrencyBalances.length > 0) {
+          // Find the primary currency balance (usually CAD for Canadian accounts)
+          const primaryBalance = balancesData.perCurrencyBalances.find(b => b.currency === 'CAD') || 
+                                balancesData.perCurrencyBalances[0];
+          
+          combinedBalances = {
+            currency: primaryBalance.currency,
+            cash: primaryBalance.cash,
+            marketValue: primaryBalance.marketValue,
+            totalEquity: primaryBalance.totalEquity,
+            buyingPower: primaryBalance.buyingPower,
+            maintenanceExcess: primaryBalance.maintenanceExcess,
+            isRealTime: primaryBalance.isRealTime
+          };
+        }
+
+        processedBalances.combinedBalances = combinedBalances;
+        accountDoc.balances = processedBalances;
+
+        // FIXED: Log the extracted cash balance for debugging
+        const cashBalance = combinedBalances.cash || 0;
+        const currency = combinedBalances.currency || 'CAD';
+        
+        logger.info(`Account ${accountData.number} balance extracted:`, {
+          personName,
+          accountId: accountData.number,
+          accountType: accountData.type,
+          cashBalance: cashBalance,
+          currency: currency,
+          totalEquity: combinedBalances.totalEquity,
+          marketValue: combinedBalances.marketValue
+        });
+
+        // Log individual currency balances for transparency
+        if (balancesData.perCurrencyBalances) {
+          balancesData.perCurrencyBalances.forEach(balance => {
+            logger.debug(`  ${balance.currency}: Cash=${balance.cash}, Market=${balance.marketValue}, Total=${balance.totalEquity}`);
+          });
         }
       }
     } catch (balanceErr) {
-      logger.error(`Failed to fetch balances for account ${accountData.number}:`, balanceErr);
+      logger.error(`Failed to fetch balances for account ${accountData.number}:`, {
+        error: balanceErr.message,
+        personName,
+        accountId: accountData.number
+      });
       // Continue without balances rather than failing completely
+      accountDoc.balances = {
+        perCurrencyBalances: [],
+        combinedBalances: {
+          currency: 'CAD',
+          cash: 0,
+          marketValue: 0,
+          totalEquity: 0,
+          buyingPower: 0,
+          maintenanceExcess: 0,
+          isRealTime: false
+        },
+        lastUpdated: new Date(),
+        syncError: balanceErr.message
+      };
     }
 
     // Save or update account
-    await Account.findOneAndUpdate(
+    const savedAccount = await Account.findOneAndUpdate(
       { accountId: accountData.number, personName },
       accountDoc,
       { upsert: true, new: true }
     );
 
-    logger.debug(`Account ${accountData.number} (${accountData.type}) synced successfully`);
+    logger.debug(`Account ${accountData.number} (${accountData.type}) synced successfully with cash balance: ${savedAccount.balances?.combinedBalances?.cash || 0}`);
+    
+    return savedAccount;
+  }
+
+  /**
+   * Force refresh account balances for all accounts of a person
+   */
+  async refreshAllAccountBalances(personName) {
+    const result = { updated: 0, errors: [] };
+
+    try {
+      const accounts = await Account.find({ personName });
+
+      for (const account of accounts) {
+        try {
+          logger.info(`Refreshing balance for account ${account.accountId}...`);
+          
+          const balancesData = await questradeApi.getAccountBalances(account.accountId, personName);
+          
+          if (balancesData) {
+            // FIXED: Use the same balance processing logic as syncSingleAccount
+            const processedBalances = {
+              perCurrencyBalances: balancesData.perCurrencyBalances || [],
+              lastUpdated: new Date()
+            };
+
+            let combinedBalances = {};
+            
+            if (balancesData.combinedBalances) {
+              if (Array.isArray(balancesData.combinedBalances) && balancesData.combinedBalances.length > 0) {
+                combinedBalances = balancesData.combinedBalances[0];
+              } else if (typeof balancesData.combinedBalances === 'object' && !Array.isArray(balancesData.combinedBalances)) {
+                combinedBalances = balancesData.combinedBalances;
+              }
+            }
+
+            if (!combinedBalances.currency && balancesData.perCurrencyBalances && balancesData.perCurrencyBalances.length > 0) {
+              const primaryBalance = balancesData.perCurrencyBalances.find(b => b.currency === 'CAD') || 
+                                    balancesData.perCurrencyBalances[0];
+              
+              combinedBalances = {
+                currency: primaryBalance.currency,
+                cash: primaryBalance.cash,
+                marketValue: primaryBalance.marketValue,
+                totalEquity: primaryBalance.totalEquity,
+                buyingPower: primaryBalance.buyingPower,
+                maintenanceExcess: primaryBalance.maintenanceExcess,
+                isRealTime: primaryBalance.isRealTime
+              };
+            }
+
+            processedBalances.combinedBalances = combinedBalances;
+
+            await Account.findOneAndUpdate(
+              { accountId: account.accountId, personName },
+              {
+                balances: processedBalances,
+                syncedAt: new Date(),
+                updatedAt: new Date()
+              }
+            );
+
+            logger.info(`Account ${account.accountId} balance updated: ${combinedBalances.currency} $${combinedBalances.cash}`);
+            result.updated++;
+          }
+        } catch (balanceError) {
+          result.errors.push({
+            accountId: account.accountId,
+            error: balanceError.message
+          });
+          logger.error(`Failed to refresh balance for account ${account.accountId}:`, balanceError);
+        }
+      }
+
+      logger.info(`Balance refresh completed for ${personName}: ${result.updated} updated, ${result.errors.length} errors`);
+      return result;
+    } catch (error) {
+      logger.error(`Error refreshing balances for ${personName}:`, error);
+      throw error;
+    }
   }
 
   /**
@@ -126,6 +279,8 @@ class AccountSync {
         byType: {},
         byStatus: {},
         totalEquity: 0,
+        totalCash: 0,
+        byCurrency: {},
         lastSyncTime: null
       };
 
@@ -138,11 +293,30 @@ class AccountSync {
         const status = account.status || 'Unknown';
         stats.byStatus[status] = (stats.byStatus[status] || 0) + 1;
 
-        // Calculate total equity
-        if (account.balances && account.balances.combinedBalances) {
-          const balance = account.balances.combinedBalances[0];
-          if (balance && balance.totalEquity) {
-            stats.totalEquity += balance.totalEquity;
+        // FIXED: Calculate total equity and cash properly
+        if (account.balances) {
+          // Add per-currency balances
+          if (account.balances.perCurrencyBalances) {
+            account.balances.perCurrencyBalances.forEach(balance => {
+              const currency = balance.currency;
+              if (!stats.byCurrency[currency]) {
+                stats.byCurrency[currency] = {
+                  cash: 0,
+                  marketValue: 0,
+                  totalEquity: 0
+                };
+              }
+              stats.byCurrency[currency].cash += balance.cash || 0;
+              stats.byCurrency[currency].marketValue += balance.marketValue || 0;
+              stats.byCurrency[currency].totalEquity += balance.totalEquity || 0;
+            });
+          }
+
+          // Add combined balances to totals (converted to CAD equivalent for summary)
+          if (account.balances.combinedBalances) {
+            const balance = account.balances.combinedBalances;
+            stats.totalEquity += balance.totalEquity || 0;
+            stats.totalCash += balance.cash || 0;
           }
         }
 
@@ -191,9 +365,25 @@ class AccountSync {
           });
         }
 
-        // Check for missing balance data
-        if (!account.balances || !account.balances.combinedBalances) {
+        // FIXED: Check for missing or invalid balance data
+        if (!account.balances) {
           issues.push({ accountId: account.accountId, issue: 'Missing balance data' });
+        } else {
+          if (!account.balances.combinedBalances) {
+            issues.push({ accountId: account.accountId, issue: 'Missing combined balance data' });
+          } else {
+            const cb = account.balances.combinedBalances;
+            if (cb.cash === undefined || cb.cash === null) {
+              issues.push({ accountId: account.accountId, issue: 'Missing cash balance' });
+            }
+            if (!cb.currency) {
+              issues.push({ accountId: account.accountId, issue: 'Missing currency information' });
+            }
+          }
+          
+          if (!account.balances.perCurrencyBalances || account.balances.perCurrencyBalances.length === 0) {
+            issues.push({ accountId: account.accountId, issue: 'Missing per-currency balance data' });
+          }
         }
       }
 
@@ -209,7 +399,7 @@ class AccountSync {
   }
 
   /**
-   * Force refresh account balances
+   * Force refresh account balances - legacy method
    */
   async refreshAccountBalances(personName, accountId = null) {
     const result = { updated: 0, errors: [] };
