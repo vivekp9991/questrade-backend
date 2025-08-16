@@ -174,7 +174,12 @@ class AccountAggregator {
       
       // If no dividendPerShare from positions, try symbol data
       if (aggregatedDividendPerShare === 0 && symbolInfo) {
-        aggregatedDividendPerShare = symbolInfo.dividendPerShare || symbolInfo.dividend || 0;
+          const freq = symbolInfo.dividendFrequency?.toLowerCase();
+        if (freq === 'monthly' || freq === 'quarterly') {
+          aggregatedDividendPerShare = symbolInfo.dividendPerShare || symbolInfo.dividend || 0;
+        } else {
+          aggregatedDividendPerShare = 0;
+        }
       }
 
       // When no dividends have been received, keep original cost values
@@ -204,9 +209,8 @@ class AccountAggregator {
         };
       });
 
-      // FIXED: Determine if this is actually a dividend stock based on real dividend data
-      const isDividendStock = totalAnnualDividend > 0 || 
-                             totalDividendsReceived > 0 || 
+      // FIXED: Determine if this is actually a dividend stock based on regular dividends
+      const isDividendStock = totalAnnualDividend > 0 ||
                              aggregatedDividendPerShare > 0;
 
       // Create aggregated position
@@ -410,13 +414,20 @@ class AccountAggregator {
         
         // If position doesn't have dividendPerShare, try symbol data
         if (dividendPerShare === 0 && symbolInfo) {
-          dividendPerShare = symbolInfo.dividendPerShare || symbolInfo.dividend || 0;
+          const freq = symbolInfo.dividendFrequency?.toLowerCase();
+          if (freq === 'monthly' || freq === 'quarterly') {
+            dividendPerShare = symbolInfo.dividendPerShare || symbolInfo.dividend || 0;
+          }
         }
         
-        // Check multiple sources to determine if this is a dividend stock
-        const hasActualDividends = (actualDividendData.annualDividend || 0) > 0 || 
-                                 (actualDividendData.totalReceived || 0) > 0 ||
-                                 dividendPerShare > 0;
+        // Check for regular dividend payments
+        const hasRegularDividends =
+          (actualDividendData.dividendFrequency === 12 || actualDividendData.dividendFrequency === 4) &&
+          ((actualDividendData.annualDividend || 0) > 0 ||
+           (actualDividendData.monthlyDividend || 0) > 0);
+
+        const hasActualDividends = hasRegularDividends || dividendPerShare > 0;
+
         
         // Enhanced logic for isDividendStock
         const isDividendStock = hasActualDividends;

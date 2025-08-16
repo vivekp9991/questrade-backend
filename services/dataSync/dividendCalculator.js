@@ -97,8 +97,14 @@ class DividendCalculator {
       };
     }
 
-    const dividendPerShare = symbolInfo.dividendPerShare || symbolInfo.dividend || 0;
     const frequency = this.parseFrequency(symbolInfo.dividendFrequency);
+
+    // Only trust dividendPerShare if dividend frequency is provided
+    const dividendPerShare = (frequency === this.DIVIDEND_FREQUENCIES.MONTHLY ||
+                             frequency === this.DIVIDEND_FREQUENCIES.QUARTERLY)
+      ? (symbolInfo.dividendPerShare || symbolInfo.dividend || 0)
+      : 0;
+
 
     return {
       dividendPerShare,
@@ -119,7 +125,8 @@ class DividendCalculator {
     if (freq.includes('semi') || freq.includes('biannual')) return this.DIVIDEND_FREQUENCIES.SEMI_ANNUAL;
     if (freq.includes('annual')) return this.DIVIDEND_FREQUENCIES.ANNUAL;
     
-    return this.DIVIDEND_FREQUENCIES.QUARTERLY; // Default
+     // Unknown frequency - treat as null rather than assuming quarterly
+    return null;
   }
 
   /**
@@ -145,7 +152,10 @@ class DividendCalculator {
     if (avgDays <= 40) return this.DIVIDEND_FREQUENCIES.MONTHLY;
     if (avgDays <= 120) return this.DIVIDEND_FREQUENCIES.QUARTERLY;
     if (avgDays <= 200) return this.DIVIDEND_FREQUENCIES.SEMI_ANNUAL;
-    return this.DIVIDEND_FREQUENCIES.ANNUAL;
+      if (avgDays <= 400) return this.DIVIDEND_FREQUENCIES.ANNUAL;
+
+    // Beyond ~13 months between payments - treat as non-regular
+    return 0;
   }
 
   /**
@@ -163,11 +173,17 @@ class DividendCalculator {
       dividendFrequency = symbolDividendInfo.frequency || 
                          this.estimateFrequencyFromHistory(dividendActivities);
 
-      // Calculate projected dividends
-      annualDividendPerShare = symbolDividendInfo.dividendPerShare * dividendFrequency;
-      annualDividend = annualDividendPerShare * shares;
-      monthlyDividendPerShare = annualDividendPerShare / 12;
-      monthlyDividend = annualDividend / 12;
+     // Only treat as dividend stock if frequency is monthly or quarterly
+      if (dividendFrequency === this.DIVIDEND_FREQUENCIES.MONTHLY ||
+          dividendFrequency === this.DIVIDEND_FREQUENCIES.QUARTERLY) {
+        // Calculate projected dividends
+        annualDividendPerShare = symbolDividendInfo.dividendPerShare * dividendFrequency;
+        annualDividend = annualDividendPerShare * shares;
+        monthlyDividendPerShare = annualDividendPerShare / 12;
+        monthlyDividend = annualDividend / 12;
+      } else {
+        dividendFrequency = 0;
+      }
     }
 
     return {
