@@ -1,4 +1,4 @@
-// services/dataSync/positionSync.js - Position Synchronization with Dividend Calculation
+// services/dataSync/positionSync.js - FIXED VERSION - Position Synchronization with Enhanced Dividend Calculation
 const questradeApi = require('../questradeApi');
 const Account = require('../../models/Account');
 const Position = require('../../models/Position');
@@ -135,7 +135,7 @@ class PositionSync {
   }
 
   /**
-   * Sync a single position with enhanced dividend calculation
+   * Sync a single position with enhanced dividend calculation - FIXED VERSION
    */
   async syncSinglePosition(positionData, account, personName, symbolInfo) {
     try {
@@ -163,6 +163,25 @@ class PositionSync {
         logger.warn(`Dividend data validation failed for ${positionData.symbol}:`, validation.warnings);
       }
 
+      // FIXED: Determine if this is a dividend stock based on actual dividends
+      const isDividendStock = (dividendData.annualDividend > 0) || 
+                             (dividendData.totalReceived > 0) ||
+                             (symbolInfo?.dividendPerShare > 0);
+
+      // FIXED: Calculate dividendPerShare from symbol or dividend data
+      let dividendPerShare = 0;
+      if (symbolInfo) {
+        const freq = symbolInfo.dividendFrequency?.toLowerCase();
+        if (freq === 'monthly' || freq === 'quarterly') {
+          dividendPerShare = symbolInfo.dividendPerShare || symbolInfo.dividend || 0;
+        }
+      }
+      
+      // If no symbol dividend info but we have actual dividends, estimate from activities
+      if (dividendPerShare === 0 && dividendData.annualDividendPerShare > 0) {
+        dividendPerShare = dividendData.annualDividendPerShare;
+      }
+
       const positionDoc = {
         personName,
         accountId: account.accountId,
@@ -186,8 +205,16 @@ class PositionSync {
         capitalGainPercent,
         capitalGainValue: positionData.openPnl || 0,
         
-        // ENHANCED: Use calculated dividend data
+        // ENHANCED: Use calculated dividend data with proper totalReceived
         dividendData,
+        
+        // FIXED: Enhanced position-level fields
+        dividendPerShare,
+        isDividendStock,
+        currency: symbolInfo?.currency || (positionData.symbol?.includes('.TO') ? 'CAD' : 'USD'),
+        securityType: symbolInfo?.securityType || 'Stock',
+        industrySector: symbolInfo?.industrySector,
+        industryGroup: symbolInfo?.industryGroup,
         
         // Market data cache (if available)
         marketData: this.extractMarketData(positionData),
@@ -206,7 +233,12 @@ class PositionSync {
         { upsert: true, new: true }
       );
 
-      logger.debug(`Position ${positionData.symbol} synced: ${positionData.openQuantity} shares @ $${positionData.currentPrice}`);
+      // FIXED: Log dividend info if significant
+      if (dividendData.totalReceived > 0) {
+        logger.debug(`Position ${positionData.symbol} synced with dividends: ${positionData.openQuantity} shares, ${dividendData.totalReceived.toFixed(2)} received`);
+      } else {
+        logger.debug(`Position ${positionData.symbol} synced: ${positionData.openQuantity} shares @ ${positionData.currentPrice}`);
+      }
       
       return savedPosition;
     } catch (error) {
@@ -241,6 +273,7 @@ class PositionSync {
         totalValue: 0,
         totalCost: 0,
         totalPnL: 0,
+        totalDividendsReceived: 0, // FIXED: Track actual dividends received
         dividendStocks: 0,
         byCurrency: {},
         lastSyncTime: null
@@ -251,9 +284,14 @@ class PositionSync {
         stats.totalCost += position.totalCost || 0;
         stats.totalPnL += position.openPnl || 0;
 
-        // Count dividend stocks
-        if (position.dividendData && position.dividendData.annualDividend > 0) {
-          stats.dividendStocks++;
+        // FIXED: Count actual dividends received
+        if (position.dividendData) {
+          stats.totalDividendsReceived += position.dividendData.totalReceived || 0;
+          
+          // Count as dividend stock if it pays dividends or has received dividends
+          if (position.dividendData.annualDividend > 0 || position.dividendData.totalReceived > 0) {
+            stats.dividendStocks++;
+          }
         }
 
         // Group by currency (from symbol data or default to CAD)
@@ -321,7 +359,7 @@ class PositionSync {
           });
         }
 
-        // Check dividend data consistency
+        // FIXED: Check dividend data consistency
         if (position.dividendData) {
           const divData = position.dividendData;
           if (divData.annualDividend < 0) {
@@ -330,6 +368,11 @@ class PositionSync {
           
           if (divData.yieldOnCost > 50) {
             issues.push({ symbol: position.symbol, issue: 'Unrealistic yield on cost' });
+          }
+          
+          // FIXED: Check for missing totalReceived when there should be dividends
+          if (divData.annualDividend > 0 && divData.totalReceived === 0) {
+            issues.push({ symbol: position.symbol, issue: 'Missing totalReceived for dividend stock' });
           }
         }
       }
@@ -346,7 +389,7 @@ class PositionSync {
   }
 
   /**
-   * Recalculate dividends for all positions of a person
+   * Recalculate dividends for all positions of a person - ENHANCED VERSION
    */
   async recalculateDividends(personName, symbol = null) {
     try {
@@ -365,6 +408,8 @@ class PositionSync {
       const symbolMap = {};
       symbols.forEach(sym => { symbolMap[sym.symbolId] = sym; });
 
+      logger.info(`Starting dividend recalculation for ${positions.length} positions${symbol ? ` for symbol ${symbol}` : ''} for ${personName}`);
+
       for (const position of positions) {
         try {
           const symbolInfo = symbolMap[position.symbolId];
@@ -379,17 +424,46 @@ class PositionSync {
             symbolInfo
           );
 
+          // FIXED: Also update isDividendStock and dividendPerShare fields
+          const isDividendStock = (newDividendData.annualDividend > 0) || 
+                                 (newDividendData.totalReceived > 0) ||
+                                 (symbolInfo?.dividendPerShare > 0);
+
+          let dividendPerShare = 0;
+          if (symbolInfo) {
+            const freq = symbolInfo.dividendFrequency?.toLowerCase();
+            if (freq === 'monthly' || freq === 'quarterly') {
+              dividendPerShare = symbolInfo.dividendPerShare || symbolInfo.dividend || 0;
+            }
+          }
+          
+          if (dividendPerShare === 0 && newDividendData.annualDividendPerShare > 0) {
+            dividendPerShare = newDividendData.annualDividendPerShare;
+          }
+
           await Position.findByIdAndUpdate(position._id, {
             dividendData: newDividendData,
+            isDividendStock,
+            dividendPerShare,
             updatedAt: new Date()
           });
 
-          updated.push(position.symbol);
+          updated.push({
+            symbol: position.symbol,
+            oldTotalReceived: position.dividendData?.totalReceived || 0,
+            newTotalReceived: newDividendData.totalReceived
+          });
+
+          if (newDividendData.totalReceived > 0) {
+            logger.debug(`Updated ${position.symbol}: totalReceived = ${newDividendData.totalReceived.toFixed(2)}`);
+          }
+
         } catch (error) {
           errors.push({
             symbol: position.symbol,
             error: error.message
           });
+          logger.error(`Error recalculating dividends for ${position.symbol}:`, error);
         }
       }
 
@@ -398,7 +472,7 @@ class PositionSync {
       return {
         updated: updated.length,
         errors: errors.length,
-        updatedSymbols: updated,
+        updatedPositions: updated,
         errorDetails: errors
       };
     } catch (error) {
@@ -432,6 +506,63 @@ class PositionSync {
       }));
     } catch (error) {
       logger.error(`Error getting stale positions for ${personName}:`, error);
+      throw error;
+    }
+  }
+
+  /**
+   * ADDED: Get dividend summary for a person
+   */
+  async getDividendSummary(personName) {
+    try {
+      const positions = await Position.find({ personName });
+      
+      const summary = {
+        totalDividendsReceived: 0,
+        annualProjectedDividends: 0,
+        monthlyProjectedDividends: 0,
+        dividendStocks: 0,
+        totalPositions: positions.length,
+        averageYield: 0,
+        topDividendPayers: []
+      };
+
+      const dividendPositions = [];
+
+      positions.forEach(position => {
+        if (position.dividendData) {
+          const divData = position.dividendData;
+          
+          summary.totalDividendsReceived += divData.totalReceived || 0;
+          summary.annualProjectedDividends += divData.annualDividend || 0;
+          summary.monthlyProjectedDividends += divData.monthlyDividend || 0;
+          
+          if (divData.annualDividend > 0 || divData.totalReceived > 0) {
+            summary.dividendStocks++;
+            
+            dividendPositions.push({
+              symbol: position.symbol,
+              totalReceived: divData.totalReceived || 0,
+              annualDividend: divData.annualDividend || 0,
+              yieldOnCost: divData.yieldOnCost || 0,
+              currentValue: position.currentMarketValue || 0
+            });
+          }
+        }
+      });
+
+      // Calculate average yield
+      const totalValue = positions.reduce((sum, pos) => sum + (pos.currentMarketValue || 0), 0);
+      summary.averageYield = totalValue > 0 ? (summary.annualProjectedDividends / totalValue) * 100 : 0;
+
+      // Get top dividend payers
+      summary.topDividendPayers = dividendPositions
+        .sort((a, b) => b.totalReceived - a.totalReceived)
+        .slice(0, 10);
+
+      return summary;
+    } catch (error) {
+      logger.error(`Error getting dividend summary for ${personName}:`, error);
       throw error;
     }
   }
