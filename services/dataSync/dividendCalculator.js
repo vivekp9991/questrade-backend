@@ -1,5 +1,6 @@
-// services/dataSync/dividendCalculator.js - FIXED VERSION - Properly calculates totalReceived
+// services/dataSync/dividendCalculator.js - FIXED VERSION - Properly calculates all dividend metrics
 const Activity = require('../../models/Activity');
+const Symbol = require('../../models/Symbol');
 const logger = require('../../utils/logger');
 
 class DividendCalculator {
@@ -17,10 +18,10 @@ class DividendCalculator {
    */
   async calculateDividendData(accountId, personName, symbolId, symbol, shares, avgCost, symbolInfo) {
     try {
-      // Get dividend activities for this symbol - FIXED: Properly get all dividend activities
+      // Get dividend activities for this symbol
       const dividendActivities = await this.getDividendActivities(accountId, personName, symbol);
       
-      // Calculate historical dividend metrics - FIXED: Properly calculate totalReceived
+      // Calculate historical dividend metrics
       const historicalMetrics = this.calculateHistoricalMetrics(dividendActivities);
       
       // Get symbol dividend information
@@ -31,26 +32,38 @@ class DividendCalculator {
         shares, 
         avgCost, 
         symbolDividendInfo, 
-        dividendActivities
+        dividendActivities,
+        symbolInfo
       );
       
-      // Calculate yield and return metrics - FIXED: Use actual totalReceived
+      // Calculate yield and return metrics
       const yieldMetrics = this.calculateYieldMetrics(
         shares, 
         avgCost, 
-        historicalMetrics.totalReceived, // FIXED: Pass actual totalReceived
-        projectedMetrics.annualDividendPerShare
+        historicalMetrics.totalReceived,
+        projectedMetrics.annualDividendPerShare,
+        projectedMetrics.annualDividend
       );
       
-      // FIXED: Log dividend calculation for debugging
-      if (historicalMetrics.totalReceived > 0) {
+      // Calculate current yield based on current price
+      const currentYield = this.calculateCurrentYield(
+        projectedMetrics.annualDividendPerShare,
+        symbolInfo
+      );
+      
+      // Log for debugging
+      if (projectedMetrics.annualDividend > 0 || historicalMetrics.totalReceived > 0) {
         logger.debug(`Dividend calculation for ${symbol}:`, {
           symbol,
           accountId,
           personName,
           dividendActivities: dividendActivities.length,
           totalReceived: historicalMetrics.totalReceived,
-          projectedAnnual: projectedMetrics.annualDividend
+          annualDividend: projectedMetrics.annualDividend,
+          dividendPerShare: projectedMetrics.dividendPerShare,
+          annualDividendPerShare: projectedMetrics.annualDividendPerShare,
+          yieldOnCost: yieldMetrics.yieldOnCost,
+          currentYield: currentYield
         });
       }
       
@@ -58,7 +71,8 @@ class DividendCalculator {
       return {
         ...historicalMetrics,
         ...projectedMetrics,
-        ...yieldMetrics
+        ...yieldMetrics,
+        currentYield: currentYield
       };
 
     } catch (error) {
@@ -68,10 +82,10 @@ class DividendCalculator {
   }
 
   /**
-   * Get dividend activities for a specific symbol - FIXED VERSION
+   * Get dividend activities for a specific symbol - ENHANCED VERSION
    */
   async getDividendActivities(accountId, personName, symbol) {
-    // FIXED: More comprehensive query to find all dividend activities
+    // More comprehensive query to find all dividend activities
     const activities = await Activity.find({
       $and: [
         { accountId },
@@ -81,13 +95,14 @@ class DividendCalculator {
           $or: [
             { type: 'Dividend' },
             { isDividend: true },
-            { rawType: { $regex: /dividend/i } }
+            { rawType: { $regex: /dividend/i } },
+            { action: { $regex: /dividend/i } },
+            { description: { $regex: /dividend/i } }
           ]
         }
       ]
     }).sort({ transactionDate: -1 });
 
-    // FIXED: Log found activities for debugging
     if (activities.length > 0) {
       logger.debug(`Found ${activities.length} dividend activities for ${symbol} in account ${accountId}`);
     }
@@ -96,12 +111,11 @@ class DividendCalculator {
   }
 
   /**
-   * Calculate historical dividend metrics from activities - FIXED VERSION
+   * Calculate historical dividend metrics from activities
    */
   calculateHistoricalMetrics(dividendActivities) {
-    // FIXED: Properly sum all dividend amounts received
+    // Calculate total dividends received
     const totalReceived = dividendActivities.reduce((sum, activity) => {
-      // FIXED: Handle different amount fields and ensure positive values
       const amount = Math.abs(activity.netAmount || activity.grossAmount || 0);
       return sum + amount;
     }, 0);
@@ -111,7 +125,6 @@ class DividendCalculator {
       Math.abs(lastDividendActivity.netAmount || lastDividendActivity.grossAmount || 0) : 0;
     const lastDividendDate = lastDividendActivity ? lastDividendActivity.transactionDate : null;
 
-    // FIXED: Log calculation details
     if (totalReceived > 0) {
       logger.debug('Historical dividend metrics calculated:', {
         totalActivities: dividendActivities.length,
@@ -129,103 +142,116 @@ class DividendCalculator {
   }
 
   /**
-   * Extract dividend information from symbol data
+   * Extract dividend information from symbol data - ENHANCED VERSION
    */
   extractSymbolDividendInfo(symbolInfo) {
     if (!symbolInfo) {
       return {
         dividendPerShare: 0,
         annualDividend: 0,
-        frequency: null
+        frequency: null,
+        yield: 0
       };
     }
 
     const frequency = this.parseFrequency(symbolInfo.dividendFrequency);
+    
+    // Get dividend per share from various possible fields
+    let dividendPerShare = 0;
+    if (symbolInfo.dividendPerShare && symbolInfo.dividendPerShare > 0) {
+      dividendPerShare = symbolInfo.dividendPerShare;
+    } else if (symbolInfo.dividend && symbolInfo.dividend > 0) {
+      dividendPerShare = symbolInfo.dividend;
+    }
 
-    // Only trust dividendPerShare if dividend frequency is provided
-    const dividendPerShare = (frequency === this.DIVIDEND_FREQUENCIES.MONTHLY ||
-                             frequency === this.DIVIDEND_FREQUENCIES.QUARTERLY)
-      ? (symbolInfo.dividendPerShare || symbolInfo.dividend || 0)
-      : 0;
+    // Calculate annual dividend if we have frequency
+    let annualDividend = 0;
+    if (dividendPerShare > 0 && frequency) {
+      annualDividend = dividendPerShare * frequency;
+    } else if (symbolInfo.annualDividend) {
+      annualDividend = symbolInfo.annualDividend;
+    }
 
     return {
       dividendPerShare,
-      annualDividend: symbolInfo.dividend || 0,
-      frequency
+      annualDividend,
+      frequency,
+      yield: symbolInfo.yield || 0,
+      exDate: symbolInfo.exDate,
+      dividendDate: symbolInfo.dividendDate
     };
   }
 
   /**
-   * Parse dividend frequency from symbol data
+   * Parse dividend frequency from symbol data - ENHANCED VERSION
    */
   parseFrequency(frequencyString) {
     if (!frequencyString) return null;
     
     const freq = frequencyString.toLowerCase();
-    if (freq.includes('quarterly')) return this.DIVIDEND_FREQUENCIES.QUARTERLY;
-    if (freq.includes('monthly')) return this.DIVIDEND_FREQUENCIES.MONTHLY;
+    if (freq.includes('month')) return this.DIVIDEND_FREQUENCIES.MONTHLY;
+    if (freq.includes('quarter')) return this.DIVIDEND_FREQUENCIES.QUARTERLY;
     if (freq.includes('semi') || freq.includes('biannual')) return this.DIVIDEND_FREQUENCIES.SEMI_ANNUAL;
-    if (freq.includes('annual')) return this.DIVIDEND_FREQUENCIES.ANNUAL;
+    if (freq.includes('annual') || freq.includes('year')) return this.DIVIDEND_FREQUENCIES.ANNUAL;
     
-    // Unknown frequency - treat as null rather than assuming quarterly
+    // Try to parse numeric frequency
+    if (freq === '12') return this.DIVIDEND_FREQUENCIES.MONTHLY;
+    if (freq === '4') return this.DIVIDEND_FREQUENCIES.QUARTERLY;
+    if (freq === '2') return this.DIVIDEND_FREQUENCIES.SEMI_ANNUAL;
+    if (freq === '1') return this.DIVIDEND_FREQUENCIES.ANNUAL;
+    
     return null;
   }
 
   /**
-   * Estimate dividend frequency from payment history
+   * Calculate projected dividend metrics - ENHANCED VERSION
    */
-  estimateFrequencyFromHistory(dividendActivities) {
-    if (dividendActivities.length < 2) {
-      return this.DIVIDEND_FREQUENCIES.QUARTERLY; // Default
-    }
-
-    // Calculate average time between payments
-    const timeDiffs = [];
-    for (let i = 0; i < dividendActivities.length - 1; i++) {
-      const timeDiff = new Date(dividendActivities[i].transactionDate) - 
-                      new Date(dividendActivities[i + 1].transactionDate);
-      const daysDiff = timeDiff / (1000 * 60 * 60 * 24);
-      timeDiffs.push(daysDiff);
-    }
-
-    const avgDays = timeDiffs.reduce((sum, days) => sum + days, 0) / timeDiffs.length;
-
-    // Determine frequency based on average days
-    if (avgDays <= 40) return this.DIVIDEND_FREQUENCIES.MONTHLY;
-    if (avgDays <= 120) return this.DIVIDEND_FREQUENCIES.QUARTERLY;
-    if (avgDays <= 200) return this.DIVIDEND_FREQUENCIES.SEMI_ANNUAL;
-    if (avgDays <= 400) return this.DIVIDEND_FREQUENCIES.ANNUAL;
-
-    // Beyond ~13 months between payments - treat as non-regular
-    return 0;
-  }
-
-  /**
-   * Calculate projected dividend metrics
-   */
-  calculateProjectedDividends(shares, avgCost, symbolDividendInfo, dividendActivities) {
+  calculateProjectedDividends(shares, avgCost, symbolDividendInfo, dividendActivities, symbolInfo) {
     let dividendFrequency = 0;
     let annualDividendPerShare = 0;
     let annualDividend = 0;
     let monthlyDividend = 0;
     let monthlyDividendPerShare = 0;
+    let dividendPerShare = 0;
 
-    if (symbolDividendInfo.dividendPerShare > 0 && shares > 0) {
-      // Use symbol frequency or estimate from history
+    // First try to use symbol dividend info
+    if (symbolDividendInfo.dividendPerShare > 0) {
+      dividendPerShare = symbolDividendInfo.dividendPerShare;
+      
+      // Get frequency from symbol or estimate from history
       dividendFrequency = symbolDividendInfo.frequency || 
                          this.estimateFrequencyFromHistory(dividendActivities);
 
-      // Only treat as dividend stock if frequency is monthly or quarterly
-      if (dividendFrequency === this.DIVIDEND_FREQUENCIES.MONTHLY ||
-          dividendFrequency === this.DIVIDEND_FREQUENCIES.QUARTERLY) {
-        // Calculate projected dividends
-        annualDividendPerShare = symbolDividendInfo.dividendPerShare * dividendFrequency;
+      if (dividendFrequency > 0) {
+        // Calculate annual dividend per share
+        annualDividendPerShare = dividendPerShare * dividendFrequency;
         annualDividend = annualDividendPerShare * shares;
         monthlyDividendPerShare = annualDividendPerShare / 12;
         monthlyDividend = annualDividend / 12;
-      } else {
-        dividendFrequency = 0;
       }
+    }
+    
+    // If no symbol data, try to estimate from historical activities
+    if (annualDividendPerShare === 0 && dividendActivities.length >= 2) {
+      const estimation = this.estimateFromHistoricalData(dividendActivities, shares);
+      if (estimation.annualDividendPerShare > 0) {
+        dividendPerShare = estimation.dividendPerShare;
+        annualDividendPerShare = estimation.annualDividendPerShare;
+        annualDividend = estimation.annualDividend;
+        monthlyDividendPerShare = annualDividendPerShare / 12;
+        monthlyDividend = annualDividend / 12;
+        dividendFrequency = estimation.frequency;
+      }
+    }
+
+    // Additional check: If symbolInfo has a yield, calculate from current price
+    if (annualDividendPerShare === 0 && symbolInfo && symbolInfo.yield > 0 && symbolInfo.prevDayClosePrice > 0) {
+      annualDividendPerShare = (symbolInfo.yield / 100) * symbolInfo.prevDayClosePrice;
+      annualDividend = annualDividendPerShare * shares;
+      monthlyDividendPerShare = annualDividendPerShare / 12;
+      monthlyDividend = annualDividend / 12;
+      dividendFrequency = this.DIVIDEND_FREQUENCIES.QUARTERLY; // Default assumption
+      dividendPerShare = annualDividendPerShare / dividendFrequency;
     }
 
     return {
@@ -233,35 +259,167 @@ class DividendCalculator {
       annualDividend,
       annualDividendPerShare,
       monthlyDividend,
-      monthlyDividendPerShare
+      monthlyDividendPerShare,
+      dividendPerShare
     };
   }
 
   /**
-   * Calculate yield and return metrics - FIXED VERSION
+   * Estimate dividend frequency from payment history - ENHANCED VERSION
    */
-  calculateYieldMetrics(shares, avgCost, totalReceived, annualDividendPerShare) {
+  estimateFrequencyFromHistory(dividendActivities) {
+    if (dividendActivities.length < 2) {
+      return this.DIVIDEND_FREQUENCIES.QUARTERLY; // Default assumption
+    }
+
+    // Calculate average time between payments
+    const timeDiffs = [];
+    for (let i = 0; i < Math.min(dividendActivities.length - 1, 5); i++) {
+      const timeDiff = new Date(dividendActivities[i].transactionDate) - 
+                      new Date(dividendActivities[i + 1].transactionDate);
+      const daysDiff = timeDiff / (1000 * 60 * 60 * 24);
+      if (daysDiff > 0 && daysDiff < 400) {
+        timeDiffs.push(daysDiff);
+      }
+    }
+
+    if (timeDiffs.length === 0) {
+      return this.DIVIDEND_FREQUENCIES.QUARTERLY;
+    }
+
+    const avgDays = timeDiffs.reduce((sum, days) => sum + days, 0) / timeDiffs.length;
+
+    // Determine frequency based on average days
+    if (avgDays <= 35) return this.DIVIDEND_FREQUENCIES.MONTHLY;
+    if (avgDays <= 100) return this.DIVIDEND_FREQUENCIES.QUARTERLY;
+    if (avgDays <= 200) return this.DIVIDEND_FREQUENCIES.SEMI_ANNUAL;
+    if (avgDays <= 380) return this.DIVIDEND_FREQUENCIES.ANNUAL;
+
+    return this.DIVIDEND_FREQUENCIES.QUARTERLY; // Default
+  }
+
+  /**
+   * Estimate dividend from historical data - NEW METHOD
+   */
+  estimateFromHistoricalData(dividendActivities, shares) {
+    if (dividendActivities.length < 2) {
+      return {
+        dividendPerShare: 0,
+        annualDividendPerShare: 0,
+        annualDividend: 0,
+        frequency: 0
+      };
+    }
+
+    // Get the last year of dividend data
+    const oneYearAgo = new Date();
+    oneYearAgo.setFullYear(oneYearAgo.getFullYear() - 1);
+    
+    const recentDividends = dividendActivities.filter(activity => 
+      new Date(activity.transactionDate) >= oneYearAgo
+    );
+
+    if (recentDividends.length === 0) {
+      // Use last 4 dividends if no recent data
+      recentDividends.push(...dividendActivities.slice(0, 4));
+    }
+
+    // Calculate average dividend per share from recent payments
+    let totalDividendPerShare = 0;
+    let validPayments = 0;
+
+    recentDividends.forEach(activity => {
+      if (activity.quantity > 0) {
+        const divPerShare = Math.abs(activity.netAmount || activity.grossAmount || 0) / activity.quantity;
+        if (divPerShare > 0) {
+          totalDividendPerShare += divPerShare;
+          validPayments++;
+        }
+      }
+    });
+
+    if (validPayments === 0) {
+      return {
+        dividendPerShare: 0,
+        annualDividendPerShare: 0,
+        annualDividend: 0,
+        frequency: 0
+      };
+    }
+
+    const avgDividendPerShare = totalDividendPerShare / validPayments;
+    const frequency = this.estimateFrequencyFromHistory(dividendActivities);
+    const annualDividendPerShare = avgDividendPerShare * frequency;
+    const annualDividend = annualDividendPerShare * shares;
+
+    return {
+      dividendPerShare: avgDividendPerShare,
+      annualDividendPerShare,
+      annualDividend,
+      frequency
+    };
+  }
+
+  /**
+   * Calculate yield and return metrics - ENHANCED VERSION
+   */
+  calculateYieldMetrics(shares, avgCost, totalReceived, annualDividendPerShare, annualDividend) {
     const totalCost = avgCost * shares;
     
-    // FIXED: Calculate dividend return percentage using actual totalReceived
+    // Calculate dividend return percentage (historical)
     const dividendReturnPercent = totalCost > 0 && totalReceived > 0 ? 
       (totalReceived / totalCost) * 100 : 0;
     
-    // Calculate yield on cost (projected)
+    // Calculate yield on cost (forward-looking based on projected dividends)
     const yieldOnCost = avgCost > 0 && annualDividendPerShare > 0 ? 
       (annualDividendPerShare / avgCost) * 100 : 0;
 
-    // FIXED: Calculate dividend-adjusted cost using actual totalReceived
-    const dividendAdjustedCostPerShare = totalReceived > 0 && shares > 0 ? 
-      Math.max(0, avgCost - (totalReceived / shares)) : avgCost;
-    const dividendAdjustedCost = dividendAdjustedCostPerShare * shares;
+    // Calculate dividend-adjusted cost
+    let dividendAdjustedCostPerShare = avgCost;
+    let dividendAdjustedCost = totalCost;
+    
+    if (totalReceived > 0 && shares > 0) {
+      dividendAdjustedCostPerShare = Math.max(0, avgCost - (totalReceived / shares));
+      dividendAdjustedCost = dividendAdjustedCostPerShare * shares;
+    }
+
+    // Calculate dividend-adjusted yield
+    const dividendAdjustedYield = dividendAdjustedCostPerShare > 0 && annualDividendPerShare > 0 ?
+      (annualDividendPerShare / dividendAdjustedCostPerShare) * 100 : 0;
 
     return {
       dividendReturnPercent,
       yieldOnCost,
       dividendAdjustedCost,
-      dividendAdjustedCostPerShare
+      dividendAdjustedCostPerShare,
+      dividendAdjustedYield
     };
+  }
+
+  /**
+   * Calculate current yield based on current price - NEW METHOD
+   */
+  calculateCurrentYield(annualDividendPerShare, symbolInfo) {
+    if (!symbolInfo || annualDividendPerShare <= 0) {
+      return 0;
+    }
+
+    // Try different price fields
+    let currentPrice = 0;
+    if (symbolInfo.lastTradePrice && symbolInfo.lastTradePrice > 0) {
+      currentPrice = symbolInfo.lastTradePrice;
+    } else if (symbolInfo.prevDayClosePrice && symbolInfo.prevDayClosePrice > 0) {
+      currentPrice = symbolInfo.prevDayClosePrice;
+    } else if (symbolInfo.bidPrice && symbolInfo.bidPrice > 0) {
+      currentPrice = symbolInfo.bidPrice;
+    }
+
+    if (currentPrice > 0) {
+      return (annualDividendPerShare / currentPrice) * 100;
+    }
+
+    // Fallback to symbol's yield field if available
+    return symbolInfo.yield || 0;
   }
 
   /**
@@ -276,175 +434,33 @@ class DividendCalculator {
       yieldOnCost: 0,
       dividendAdjustedCost: avgCost * shares,
       dividendAdjustedCostPerShare: avgCost,
+      dividendAdjustedYield: 0,
       monthlyDividend: 0,
       monthlyDividendPerShare: 0,
       annualDividend: 0,
       annualDividendPerShare: 0,
-      dividendFrequency: 0
+      dividendFrequency: 0,
+      dividendPerShare: 0,
+      currentYield: 0
     };
   }
 
   /**
-   * Validate dividend calculation results
-   */
-  validateDividendData(dividendData, symbol) {
-    const warnings = [];
-
-    // Check for negative values
-    if (dividendData.totalReceived < 0) {
-      warnings.push(`Negative totalReceived for ${symbol}`);
-    }
-
-    if (dividendData.annualDividend < 0) {
-      warnings.push(`Negative annualDividend for ${symbol}`);
-    }
-
-    // Check for unrealistic yield values
-    if (dividendData.yieldOnCost > 50) {
-      warnings.push(`Unusually high yield on cost (${dividendData.yieldOnCost.toFixed(2)}%) for ${symbol}`);
-    }
-
-    // Check for unrealistic frequency
-    if (dividendData.dividendFrequency > 12) {
-      warnings.push(`Unrealistic dividend frequency (${dividendData.dividendFrequency}) for ${symbol}`);
-    }
-
-    if (warnings.length > 0) {
-      logger.warn(`Dividend data validation warnings for ${symbol}:`, warnings);
-    }
-
-    return {
-      isValid: warnings.length === 0,
-      warnings
-    };
-  }
-
-  /**
-   * Calculate dividend growth rate from historical data
-   */
-  calculateDividendGrowthRate(dividendActivities) {
-    if (dividendActivities.length < 4) {
-      return null; // Need at least 4 payments to calculate meaningful growth
-    }
-
-    // Group dividends by year
-    const dividendsByYear = {};
-    dividendActivities.forEach(activity => {
-      const year = new Date(activity.transactionDate).getFullYear();
-      if (!dividendsByYear[year]) {
-        dividendsByYear[year] = 0;
-      }
-      dividendsByYear[year] += Math.abs(activity.netAmount);
-    });
-
-    const years = Object.keys(dividendsByYear).sort().map(Number);
-    if (years.length < 2) {
-      return null;
-    }
-
-    // Calculate year-over-year growth rates
-    const growthRates = [];
-    for (let i = 1; i < years.length; i++) {
-      const currentYear = years[i];
-      const previousYear = years[i - 1];
-      const currentAmount = dividendsByYear[currentYear];
-      const previousAmount = dividendsByYear[previousYear];
-
-      if (previousAmount > 0) {
-        const growthRate = ((currentAmount - previousAmount) / previousAmount) * 100;
-        growthRates.push(growthRate);
-      }
-    }
-
-    if (growthRates.length === 0) {
-      return null;
-    }
-
-    // Return average growth rate
-    const avgGrowthRate = growthRates.reduce((sum, rate) => sum + rate, 0) / growthRates.length;
-    return {
-      averageGrowthRate: avgGrowthRate,
-      yearlyGrowthRates: growthRates,
-      yearsOfData: years.length
-    };
-  }
-
-  /**
-   * Get dividend calendar for a symbol
-   */
-  async getDividendCalendar(accountId, personName, symbol, months = 12) {
-    try {
-      const startDate = new Date();
-      startDate.setMonth(startDate.getMonth() - months);
-
-      const dividends = await Activity.find({
-        accountId,
-        personName,
-        symbol,
-        type: 'Dividend',
-        transactionDate: { $gte: startDate }
-      }).sort({ transactionDate: -1 });
-
-      return dividends.map(dividend => ({
-        date: dividend.transactionDate,
-        amount: Math.abs(dividend.netAmount),
-        quantity: dividend.quantity,
-        dividendPerShare: dividend.quantity > 0 ? 
-          Math.abs(dividend.netAmount) / dividend.quantity : 0,
-        description: dividend.description
-      }));
-    } catch (error) {
-      logger.error(`Error getting dividend calendar for ${symbol}:`, error);
-      return [];
-    }
-  }
-
-  /**
-   * Predict next dividend payment based on historical data
-   */
-  predictNextDividend(dividendActivities, dividendFrequency) {
-    if (dividendActivities.length === 0 || !dividendFrequency) {
-      return null;
-    }
-
-    const lastPayment = dividendActivities[0];
-    const lastPaymentDate = new Date(lastPayment.transactionDate);
-    
-    // Calculate months between payments
-    const monthsBetweenPayments = 12 / dividendFrequency;
-    
-    // Predict next payment date
-    const nextPaymentDate = new Date(lastPaymentDate);
-    nextPaymentDate.setMonth(nextPaymentDate.getMonth() + monthsBetweenPayments);
-
-    // Estimate amount based on recent payments
-    const recentPayments = dividendActivities.slice(0, Math.min(4, dividendActivities.length));
-    const avgAmount = recentPayments.reduce((sum, payment) => 
-      sum + Math.abs(payment.netAmount), 0) / recentPayments.length;
-
-    return {
-      estimatedDate: nextPaymentDate,
-      estimatedAmount: avgAmount,
-      confidence: recentPayments.length >= 2 ? 'high' : 'low'
-    };
-  }
-
-  /**
-   * ADDED: Force recalculate dividends for all positions
+   * Force recalculate dividends for all positions - ENHANCED VERSION
    */
   async recalculateAllDividends(personName) {
     try {
       const Position = require('../../models/Position');
-      const Symbol = require('../../models/Symbol');
       
       const positions = await Position.find({ personName });
       let updated = 0;
+      let withDividends = 0;
       
       logger.info(`Starting dividend recalculation for ${positions.length} positions for ${personName}`);
       
       for (const position of positions) {
         try {
-          // Get symbol info
+          // Get fresh symbol info
           const symbol = await Symbol.findOne({ symbolId: position.symbolId });
           
           // Recalculate dividend data
@@ -458,14 +474,22 @@ class DividendCalculator {
             symbol
           );
           
+          // Determine if this is a dividend stock
+          const isDividendStock = (newDividendData.annualDividend > 0) || 
+                                 (newDividendData.totalReceived > 0) ||
+                                 (newDividendData.dividendPerShare > 0);
+          
           // Update position
           await Position.findByIdAndUpdate(position._id, {
             dividendData: newDividendData,
+            dividendPerShare: newDividendData.dividendPerShare,
+            isDividendStock: isDividendStock,
             updatedAt: new Date()
           });
           
-          if (newDividendData.totalReceived > 0) {
-            logger.debug(`Updated ${position.symbol}: totalReceived = $${newDividendData.totalReceived.toFixed(2)}`);
+          if (newDividendData.totalReceived > 0 || newDividendData.annualDividend > 0) {
+            logger.debug(`Updated ${position.symbol}: totalReceived = $${newDividendData.totalReceived.toFixed(2)}, annual = $${newDividendData.annualDividend.toFixed(2)}`);
+            withDividends++;
           }
           
           updated++;
@@ -474,8 +498,8 @@ class DividendCalculator {
         }
       }
       
-      logger.info(`Dividend recalculation completed for ${personName}: ${updated} positions updated`);
-      return { updated, total: positions.length };
+      logger.info(`Dividend recalculation completed for ${personName}: ${updated} positions updated, ${withDividends} with dividends`);
+      return { updated, total: positions.length, withDividends };
     } catch (error) {
       logger.error(`Error in recalculateAllDividends for ${personName}:`, error);
       throw error;
