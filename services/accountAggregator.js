@@ -1153,4 +1153,4 @@ class AccountAggregator {
   }
 }
 
-module.exports = AccountAggregator;
+module.exports = new AccountAggregator();
