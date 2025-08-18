@@ -1,4 +1,4 @@
-// services/accountAggregator.js - FIXED VERSION - Proper Portfolio-wide Yield on Cost calculation
+// services/accountAggregator.js - ENHANCED VERSION - Yield calculation with dividend-only option
 const Position = require('../models/Position');
 const Activity = require('../models/Activity');
 const Account = require('../models/Account');
@@ -82,7 +82,7 @@ class AccountAggregator {
     }
   }
 
-  // Aggregate multiple positions of the same symbol with FIXED dividend calculations
+  // FIXED: Aggregate multiple positions of the same symbol with proper totalReceived calculation
   async aggregateSymbolPositions(symbol, positions, accountMap = {}) {
     try {
       // Get symbol info for the aggregated position
@@ -92,8 +92,9 @@ class AccountAggregator {
       let totalShares = 0;
       let totalCost = 0;
       let totalMarketValue = 0;
-      let totalDividendsReceived = 0;
-      let totalAnnualDividend = 0; // FIXED: Track annual dividend separately
+      let totalDividendsReceived = 0; // FIXED: Initialize properly
+      let totalMonthlyDividend = 0;
+      let totalAnnualDividend = 0;
       let totalOpenPnl = 0;
       let totalDayPnl = 0;
       
@@ -103,10 +104,10 @@ class AccountAggregator {
       let latestMarketData = null;
       let latestSyncedAt = null;
 
-      // Track dividend per share values for consistency
+      // FIXED: Track dividend per share from positions (use the most common/recent value)
       const dividendPerShareValues = [];
 
-      // FIXED: Aggregate values from all positions including proper dividend calculations
+      // FIXED: Aggregate values from all positions including totalReceived
       positions.forEach(position => {
         totalShares += position.openQuantity || 0;
         totalCost += position.totalCost || 0;
@@ -124,13 +125,14 @@ class AccountAggregator {
           latestSyncedAt = position.syncedAt;
         }
         
-        // FIXED: Aggregate dividend data properly
+        // FIXED: Aggregate dividend data including totalReceived
         if (position.dividendData) {
-          totalDividendsReceived += position.dividendData.totalReceived || 0;
-          totalAnnualDividend += position.dividendData.annualDividend || 0; // Sum up annual dividends
+          totalDividendsReceived += position.dividendData.totalReceived || 0; // FIXED: Properly aggregate totalReceived
+          totalMonthlyDividend += position.dividendData.monthlyDividend || 0;
+          totalAnnualDividend += position.dividendData.annualDividend || 0;
         }
 
-        // Collect dividendPerShare values from positions
+        // FIXED: Collect dividendPerShare values from positions
         if (position.dividendPerShare && position.dividendPerShare > 0) {
           dividendPerShareValues.push(position.dividendPerShare);
         }
@@ -138,31 +140,31 @@ class AccountAggregator {
 
       // Calculate aggregated metrics
       const weightedAverageCost = totalShares > 0 ? totalCost / totalShares : 0;
-      const totalReturnValue = totalOpenPnl + totalDividendsReceived;
+      const totalReturnValue = totalOpenPnl + totalDividendsReceived; // FIXED: Use actual totalDividendsReceived
       const totalReturnPercent = totalCost > 0 ? (totalReturnValue / totalCost) * 100 : 0;
       const capitalGainPercent = totalCost > 0 ? (totalOpenPnl / totalCost) * 100 : 0;
       
-      // FIXED: Calculate yield on cost for aggregated position
-      // Portfolio-wide calculation: (Total Annual Dividend / Total Cost) * 100
-      const yieldOnCost = totalCost > 0 && totalAnnualDividend > 0 ? 
-        (totalAnnualDividend / totalCost) * 100 : 0;
-        
-      // Calculate dividend return percentage using actual totalReceived
-      const dividendReturnPercent = totalCost > 0 && totalDividendsReceived > 0 ? 
-        (totalDividendsReceived / totalCost) * 100 : 0;
+      // FIXED: Dividend metrics using actual totalDividendsReceived
+      const dividendReturnPercent = totalCost > 0 ? (totalDividendsReceived / totalCost) * 100 : 0;
+      const yieldOnCost = weightedAverageCost > 0 && totalShares > 0
+        ? ((totalAnnualDividend / totalShares) / weightedAverageCost) * 100
+        : 0;
 
-      // Calculate dividendPerShare for aggregated position
+      // FIXED: Calculate dividendPerShare more intelligently
       let aggregatedDividendPerShare = 0;
       
-      // Use the most common value, or if tied, the highest value
+      // First, try to use values from positions
       if (dividendPerShareValues.length > 0) {
+        // Use the most common value, or if tied, the highest value
         const valueCount = {};
         dividendPerShareValues.forEach(val => {
           valueCount[val] = (valueCount[val] || 0) + 1;
         });
         
+        // Get the most frequent value
         const sortedValues = Object.entries(valueCount)
           .sort((a, b) => {
+            // Sort by frequency first, then by value (descending)
             if (b[1] !== a[1]) return b[1] - a[1];
             return parseFloat(b[0]) - parseFloat(a[0]);
           });
@@ -175,10 +177,12 @@ class AccountAggregator {
         const freq = symbolInfo.dividendFrequency?.toLowerCase();
         if (freq === 'monthly' || freq === 'quarterly') {
           aggregatedDividendPerShare = symbolInfo.dividendPerShare || symbolInfo.dividend || 0;
+        } else {
+          aggregatedDividendPerShare = 0;
         }
       }
 
-      // Calculate dividend-adjusted cost using actual totalReceived
+      // FIXED: When dividends have been received, adjust cost appropriately
       let dividendAdjustedCostPerShare;
       let dividendAdjustedCost;
 
@@ -205,20 +209,15 @@ class AccountAggregator {
         };
       });
 
-      // Determine if this is actually a dividend stock
+      // FIXED: Determine if this is actually a dividend stock based on regular dividends
       const isDividendStock = totalAnnualDividend > 0 ||
                              aggregatedDividendPerShare > 0 ||
-                             totalDividendsReceived > 0;
-
-      // FIXED: Calculate monthly dividends
-      const monthlyDividend = totalAnnualDividend / 12;
-      const monthlyDividendPerShare = totalShares > 0 ? monthlyDividend / totalShares : 0;
-      const annualDividendPerShare = totalShares > 0 ? totalAnnualDividend / totalShares : 0;
+                             totalDividendsReceived > 0; // FIXED: Also check if dividends have been received
 
       // Create aggregated position
       const aggregatedPosition = {
         symbol,
-        symbolId: positions[0].symbolId,
+        symbolId: positions[0].symbolId, // Same for all positions of this symbol
         personName: personNames.size === 1 ? Array.from(personNames)[0] : 'Multiple',
         accountId: 'AGGREGATED',
       
@@ -241,17 +240,17 @@ class AccountAggregator {
         capitalGainPercent,
         capitalGainValue: totalOpenPnl,
         
-        // FIXED: Aggregated dividend data with proper yield on cost
+        // FIXED: Aggregated dividend data with proper totalReceived
         dividendData: {
-          totalReceived: totalDividendsReceived,
+          totalReceived: totalDividendsReceived, // FIXED: Use aggregated totalDividendsReceived
           dividendReturnPercent,
-          yieldOnCost, // FIXED: Now calculated properly
+          yieldOnCost,
           dividendAdjustedCost,
           dividendAdjustedCostPerShare,
-          monthlyDividend,
-          monthlyDividendPerShare,
-          annualDividend: totalAnnualDividend, // FIXED: Sum of all annual dividends
-          annualDividendPerShare,
+          monthlyDividend: totalMonthlyDividend,
+          monthlyDividendPerShare: totalShares > 0 ? totalMonthlyDividend / totalShares : 0,
+          annualDividend: totalAnnualDividend,
+          annualDividendPerShare: totalShares > 0 ? totalAnnualDividend / totalShares : 0,
           lastDividendDate: this.getLatestDividendDate(positions),
           lastDividendAmount: this.getLatestDividendAmount(positions)
         },
@@ -269,7 +268,7 @@ class AccountAggregator {
         syncedAt: latestSyncedAt,
         updatedAt: new Date(),
         
-        // Position-level dividend info
+        // FIXED: Use properly calculated dividend per share
         dividendPerShare: aggregatedDividendPerShare,
         industrySector: symbolInfo?.industrySector,
         industryGroup: symbolInfo?.industryGroup,
@@ -279,8 +278,8 @@ class AccountAggregator {
       };
 
       // FIXED: Log aggregation details for debugging
-      if (totalAnnualDividend > 0) {
-        logger.debug(`Aggregated ${symbol}: Annual Dividend=$${totalAnnualDividend.toFixed(2)}, YoC=${yieldOnCost.toFixed(2)}%, positions=${positions.length}`);
+      if (totalDividendsReceived > 0) {
+        logger.debug(`Aggregated ${symbol}: totalReceived=${totalDividendsReceived.toFixed(2)}, positions=${positions.length}`);
       }
 
       return aggregatedPosition;
@@ -290,7 +289,7 @@ class AccountAggregator {
     }
   }
 
-  // FIXED: Get portfolio summary with proper yield on cost calculation
+  // ENHANCED: Get portfolio summary with yield calculation options
   async getAggregatedSummary(viewMode, personName = null, accountId = null, options = {}) {
     try {
       const { dividendStocksOnly = null } = options;
@@ -327,19 +326,17 @@ class AccountAggregator {
 
       const accounts = await Account.find(accountQuery).lean();
 
-      // FIXED: Calculate summary metrics with proper yield on cost
+      // Calculate summary metrics
       let totalInvestment = 0;
       let currentValue = 0;
       let unrealizedPnl = 0;
-      let totalDividends = 0;
+      let totalDividends = 0; // FIXED: This should be total dividends received
       let monthlyDividendIncome = 0;
       let annualProjectedDividend = 0;
       
-      // FIXED: Portfolio-wide yield on cost calculation
-      let portfolioTotalCost = 0;           // Sum of all stock total costs
-      let portfolioTotalAnnualDividend = 0; // Sum of all stock annual dividends
-      let yieldCalculationTotalCost = 0;    // For dividend-stocks-only calculation
-      let yieldCalculationAnnualDividend = 0; // For dividend-stocks-only calculation
+      // ENHANCED: Separate calculations for yield on cost
+      let yieldCalculationInvestment = 0;
+      let yieldCalculationDividends = 0;
       
       const sectorMap = {};
       const currencyMap = {};
@@ -355,28 +352,22 @@ class AccountAggregator {
         unrealizedPnl += positionPnl;
         
         if (position.dividendData) {
-          totalDividends += position.dividendData.totalReceived || 0;
+          totalDividends += position.dividendData.totalReceived || 0; // FIXED: Use totalReceived for actual dividends received
           monthlyDividendIncome += position.dividendData.monthlyDividend || 0;
           annualProjectedDividend += position.dividendData.annualDividend || 0;
         }
         
-        // FIXED: Portfolio-wide yield on cost calculation
-        // Total Cost = sum of (no of shares * average cost) for each stock
-        // Total Annual Dividend = sum of annual dividends for each stock
-        portfolioTotalCost += positionCost;
-        portfolioTotalAnnualDividend += position.dividendData?.annualDividend || 0;
-        
-        // FIXED: Yield calculation based on preference (dividend stocks only or all stocks)
+        // ENHANCED: Calculate yield basis based on preference
         if (useDividendStocksOnly) {
           // Only include dividend-paying stocks in yield calculation
           if (position.isDividendStock && position.dividendData && position.dividendData.annualDividend > 0) {
-            yieldCalculationTotalCost += positionCost;
-            yieldCalculationAnnualDividend += position.dividendData.annualDividend || 0;
+            yieldCalculationInvestment += positionCost;
+            yieldCalculationDividends += position.dividendData.annualDividend || 0;
           }
         } else {
           // Include all stocks in yield calculation
-          yieldCalculationTotalCost += positionCost;
-          yieldCalculationAnnualDividend += position.dividendData?.annualDividend || 0;
+          yieldCalculationInvestment += positionCost;
+          yieldCalculationDividends += position.dividendData?.annualDividend || 0;
         }
         
         // Sector allocation
@@ -393,18 +384,13 @@ class AccountAggregator {
         }
       });
 
-      const totalReturnValue = unrealizedPnl + totalDividends;
+      const totalReturnValue = unrealizedPnl + totalDividends; // FIXED: totalDividends is now actual dividends received
       const totalReturnPercent = totalInvestment > 0 ? (totalReturnValue / totalInvestment) * 100 : 0;
       const averageYieldPercent = currentValue > 0 ? (annualProjectedDividend / currentValue) * 100 : 0;
       
-      // FIXED: Portfolio-wide Yield on Cost calculation
-      // Portfolio YoC = (Sum of all stock Total Annual Dividend / Sum of all stock Total Cost) * 100
-      const portfolioYieldOnCost = portfolioTotalCost > 0 ? 
-        (portfolioTotalAnnualDividend / portfolioTotalCost) * 100 : 0;
-        
-      // Yield calculation based on user preference (dividend stocks only or all stocks)
-      const yieldOnCostPercent = yieldCalculationTotalCost > 0 ? 
-        (yieldCalculationAnnualDividend / yieldCalculationTotalCost) * 100 : 0;
+      // ENHANCED: Calculate yield on cost based on preference
+      const yieldOnCostPercent = yieldCalculationInvestment > 0 ? 
+        (yieldCalculationDividends / yieldCalculationInvestment) * 100 : 0;
 
       // Count dividend stocks for summary
       const dividendStockCount = positions.filter(p => 
@@ -479,19 +465,6 @@ class AccountAggregator {
       // Determine primary currency (most common currency in positions)
       const primaryCurrency = Object.entries(currencyMap).sort((a, b) => b[1] - a[1])[0]?.[0] || 'CAD';
 
-      // FIXED: Log portfolio yield calculation for debugging
-      if (portfolioYieldOnCost > 0) {
-        logger.debug('Portfolio Yield on Cost calculation:', {
-          portfolioTotalCost: portfolioTotalCost.toFixed(2),
-          portfolioTotalAnnualDividend: portfolioTotalAnnualDividend.toFixed(2),
-          portfolioYieldOnCost: portfolioYieldOnCost.toFixed(2) + '%',
-          yieldCalculationTotalCost: yieldCalculationTotalCost.toFixed(2),
-          yieldCalculationAnnualDividend: yieldCalculationAnnualDividend.toFixed(2),
-          yieldOnCostPercent: yieldOnCostPercent.toFixed(2) + '%',
-          useDividendStocksOnly
-        });
-      }
-
       return {
         viewMode,
         personName,
@@ -502,30 +475,27 @@ class AccountAggregator {
         totalReturnValue,
         totalReturnPercent,
         unrealizedPnl,
-        totalDividends,
+        totalDividends, // FIXED: This is now actual dividends received
         monthlyDividendIncome,
         annualProjectedDividend,
         averageYieldPercent,
-        yieldOnCostPercent, // Based on user preference (dividend stocks only or all stocks)
-        portfolioYieldOnCost, // FIXED: True portfolio-wide yield on cost
+        yieldOnCostPercent, // ENHANCED: Now calculated based on user preference
         numberOfPositions: positions.length,
         numberOfAccounts: accountIds.size,
         numberOfDividendStocks: dividendStockCount,
         sectorAllocation,
         currencyBreakdown,
         personBreakdown: viewMode === 'all' ? personBreakdown : [],
-        accounts: accountsSummary,
+        accounts: accountsSummary, // Enhanced accounts array with currency info
         aggregationInfo: {
           hasAggregatedPositions: positions.some(p => p.isAggregated),
           totalAggregatedSymbols: positions.filter(p => p.isAggregated).length
         },
-        // FIXED: Enhanced yield calculation metadata
+        // ENHANCED: Yield calculation metadata
         yieldCalculationInfo: {
           useDividendStocksOnly,
-          yieldCalculationTotalCost,
-          yieldCalculationAnnualDividend,
-          portfolioTotalCost,
-          portfolioTotalAnnualDividend,
+          yieldCalculationInvestment,
+          yieldCalculationDividends,
           dividendStockCount,
           totalPositionCount: positions.length
         }
@@ -536,7 +506,7 @@ class AccountAggregator {
     }
   }
 
-  // Enrich positions with additional symbol information
+  // Enrich positions with additional symbol information - FIXED
   async enrichPositions(positions) {
     try {
       const symbolIds = [...new Set(positions.map(p => p.symbolId))];
@@ -548,7 +518,7 @@ class AccountAggregator {
         const symbolInfo = symbolMap[position.symbolId];
         const actualDividendData = position.dividendData || {};
         
-        // Prioritize existing dividendPerShare from position data
+        // FIXED: Prioritize existing dividendPerShare from position data
         let dividendPerShare = position.dividendPerShare || 0;
         
         // If position doesn't have dividendPerShare, try symbol data
@@ -567,14 +537,15 @@ class AccountAggregator {
 
         const hasActualDividends = hasRegularDividends || 
                                   dividendPerShare > 0 || 
-                                  (actualDividendData.totalReceived || 0) > 0 ||
-                                  (actualDividendData.annualDividend || 0) > 0;
+                                  (actualDividendData.totalReceived || 0) > 0; // FIXED: Check if dividends have been received
 
+        
         // Enhanced logic for isDividendStock
         const isDividendStock = hasActualDividends;
         
         return {
           ...position,
+          // FIXED: Always preserve the calculated dividendPerShare value
           dividendPerShare: isDividendStock ? dividendPerShare : 0,
           industrySector: position.industrySector || symbolInfo?.industrySector,
           industryGroup: position.industryGroup || symbolInfo?.industryGroup,
