@@ -266,12 +266,12 @@ const BalanceSchema = new Schema({
 
 // Main Position Schema
 const PositionSchema = new Schema({
-  // Core identification
+  // Core identification - FIXED: positionId is NOT required, can be generated
   positionId: {
     type: String,
-    required: true,
+    // REMOVED required: true - this field can be auto-generated or optional
     index: true,
-    description: 'Unique position identifier from broker'
+    description: 'Unique position identifier from broker or generated'
   },
   accountId: {
     type: String,
@@ -419,10 +419,13 @@ const PositionSchema = new Schema({
     type: String,
     description: 'Industry sub-group classification'
   },
+  // FIXED: securityType enum now includes both cases and normalizes input
   securityType: {
     type: String,
-    enum: ['stock', 'etf', 'mutual_fund', 'bond', 'option', 'other'],
+    enum: ['stock', 'etf', 'mutual_fund', 'bond', 'option', 'other', 
+           'Stock', 'ETF', 'Mutual_Fund', 'Bond', 'Option', 'Other'], // Added capitalized versions
     default: 'stock',
+    lowercase: true, // Automatically convert to lowercase before saving
     description: 'Type of security'
   },
   currency: {
@@ -501,6 +504,70 @@ const PositionSchema = new Schema({
   collection: 'positions'
 });
 
+// Pre-save middleware to handle field initialization and normalization
+PositionSchema.pre('save', function(next) {
+  // FIXED: Generate positionId if not provided
+  if (!this.positionId) {
+    // Generate a unique positionId based on account and symbol
+    this.positionId = `${this.accountId}_${this.symbolId}_${Date.now()}`;
+  }
+  
+  // FIXED: Normalize securityType to lowercase
+  if (this.securityType) {
+    this.securityType = this.securityType.toLowerCase();
+  }
+  
+  // Ensure dividend calculations are current
+  if (this.isModified('openQuantity') || this.isModified('dividendData') || this.isModified('averageEntryPrice')) {
+    this.calculateTotalReturn();
+  }
+  
+  // Update isDividendStock flag
+  if (this.isModified('dividendData') || this.isModified('dividendPerShare')) {
+    this.isDividendStock = (this.dividendData?.annualDividend > 0) || 
+                          (this.dividendData?.totalReceived > 0) || 
+                          (this.dividendPerShare > 0);
+  }
+  
+  // Update timestamps
+  this.updatedAt = new Date();
+  
+  next();
+});
+
+// Pre-validate middleware to handle field normalization before validation
+PositionSchema.pre('validate', function(next) {
+  // FIXED: Generate positionId if missing before validation
+  if (!this.positionId) {
+    this.positionId = `${this.accountId}_${this.symbolId}_${Date.now()}`;
+  }
+  
+  // FIXED: Normalize securityType before validation
+  if (this.securityType) {
+    const normalizedType = this.securityType.toLowerCase();
+    // Map common variations to valid enum values
+    const typeMapping = {
+      'stock': 'stock',
+      'stocks': 'stock',
+      'equity': 'stock',
+      'etf': 'etf',
+      'etfs': 'etf',
+      'mutual_fund': 'mutual_fund',
+      'mutual fund': 'mutual_fund',
+      'mutualfund': 'mutual_fund',
+      'bond': 'bond',
+      'bonds': 'bond',
+      'option': 'option',
+      'options': 'option',
+      'other': 'other'
+    };
+    
+    this.securityType = typeMapping[normalizedType] || 'other';
+  }
+  
+  next();
+});
+
 // Indexes for performance
 PositionSchema.index({ accountId: 1, symbol: 1 });
 PositionSchema.index({ personName: 1, symbol: 1 });
@@ -508,6 +575,8 @@ PositionSchema.index({ symbol: 1, syncedAt: -1 });
 PositionSchema.index({ isDividendStock: 1, symbol: 1 });
 PositionSchema.index({ 'dividendData.lastDividendDate': -1 });
 PositionSchema.index({ isAggregated: 1, symbol: 1 });
+// FIXED: Compound index for positionId queries
+PositionSchema.index({ positionId: 1, accountId: 1, personName: 1 });
 
 // Virtual fields
 PositionSchema.virtual('marketValueCAD').get(function() {
@@ -619,25 +688,23 @@ PositionSchema.statics.getPortfolioSummary = function(personName) {
   ]);
 };
 
-// Pre-save middleware
-PositionSchema.pre('save', function(next) {
-  // Ensure dividend calculations are current
-  if (this.isModified('openQuantity') || this.isModified('dividendData') || this.isModified('averageEntryPrice')) {
-    this.calculateTotalReturn();
+// FIXED: Static method to handle updates without positionId
+PositionSchema.statics.findOneAndUpdateSafe = function(filter, update, options) {
+  // If updating and positionId is missing, generate one
+  if (!filter.positionId && filter.accountId && filter.symbolId) {
+    filter.positionId = `${filter.accountId}_${filter.symbolId}_${Date.now()}`;
   }
   
-  // Update isDividendStock flag
-  if (this.isModified('dividendData') || this.isModified('dividendPerShare')) {
-    this.isDividendStock = (this.dividendData?.annualDividend > 0) || 
-                          (this.dividendData?.totalReceived > 0) || 
-                          (this.dividendPerShare > 0);
+  // Ensure securityType is normalized in updates
+  if (update.$set && update.$set.securityType) {
+    update.$set.securityType = update.$set.securityType.toLowerCase();
+  }
+  if (update.securityType) {
+    update.securityType = update.securityType.toLowerCase();
   }
   
-  // Update timestamps
-  this.updatedAt = new Date();
-  
-  next();
-});
+  return this.findOneAndUpdate(filter, update, options);
+};
 
 // Post-save middleware for logging
 PositionSchema.post('save', function(doc) {
