@@ -9,7 +9,7 @@ const Account = require('../models/Account');
 const Person = require('../models/Person');
 const DividendCalculator = require('../services/dataSync/dividendCalculator');
 const logger = require('../utils/logger');
-const config = require('../config');
+require('dotenv').config();
 
 class DividendRecalculator {
   constructor(options = {}) {
@@ -85,10 +85,8 @@ class DividendRecalculator {
 
   async connectDatabase() {
     try {
-      await mongoose.connect(config.mongodb.uri, {
-        useNewUrlParser: true,
-        useUnifiedTopology: true
-      });
+      const mongoUri = process.env.MONGODB_URI || 'mongodb://localhost:27017/questrade_portfolio';
+      await mongoose.connect(mongoUri);
       console.log('📊 Connected to MongoDB');
     } catch (error) {
       console.error('❌ Database connection failed:', error);
@@ -321,19 +319,24 @@ class DividendRecalculator {
       const activities = await Activity.find({
         symbolId: position.symbolId,
         accountId: position.accountId,
-        activityType: { $in: ['dividend', 'distribution', 'Dividends'] }
-      }).sort({ activityDate: 1 });
+        type: { $in: ['Dividend', 'Dividends'] }
+      }).sort({ transactionDate: 1 });
       
       if (activities.length === 0) {
         return null;
       }
       
-      return await this.dividendCalculator.calculateDividendMetrics(
-        position.symbolId,
+      // Get symbol info for additional data
+      const symbol = await Symbol.findOne({ symbolId: position.symbolId });
+      
+      return await this.dividendCalculator.calculateDividendData(
         position.accountId,
+        position.personName,
+        position.symbolId,
+        position.symbol,
         position.openQuantity,
         position.averageEntryPrice,
-        position.currentPrice
+        symbol
       );
     } catch (error) {
       console.error(`Error calculating from activities for ${position.symbol}:`, error);
