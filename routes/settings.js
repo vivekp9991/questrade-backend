@@ -1,4 +1,4 @@
-// routes/settings.js
+// routes/settings.js - ENHANCED VERSION - Added portfolio settings endpoints
 const express = require('express');
 const router = express.Router();
 const Person = require('../models/Person');
@@ -58,6 +58,183 @@ router.get('/dashboard', asyncHandler(async (req, res) => {
       recentErrors
     }
   });
+}));
+
+// ADDED: Get portfolio settings for a person
+router.get('/portfolio/:personName', asyncHandler(async (req, res) => {
+  const { personName } = req.params;
+  
+  try {
+    const person = await Person.findOne({ personName });
+    if (!person) {
+      return res.status(404).json({
+        success: false,
+        error: 'Person not found'
+      });
+    }
+
+    const portfolioPreferences = person.getPortfolioPreferences();
+    
+    res.json({
+      success: true,
+      data: {
+        personName,
+        portfolioPreferences,
+        updatedAt: person.updatedAt
+      }
+    });
+  } catch (error) {
+    logger.error('Error getting portfolio settings:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to get portfolio settings'
+    });
+  }
+}));
+
+// ADDED: Update portfolio settings for a person
+router.put('/portfolio/:personName', asyncHandler(async (req, res) => {
+  const { personName } = req.params;
+  const { portfolioPreferences } = req.body;
+  
+  if (!portfolioPreferences || typeof portfolioPreferences !== 'object') {
+    return res.status(400).json({
+      success: false,
+      error: 'portfolioPreferences object is required'
+    });
+  }
+
+  try {
+    const person = await Person.findOne({ personName });
+    if (!person) {
+      return res.status(404).json({
+        success: false,
+        error: 'Person not found'
+      });
+    }
+
+    // Validate preference values
+    const validPreferences = {};
+    
+    if (portfolioPreferences.hasOwnProperty('yieldOnCostDividendOnly')) {
+      if (typeof portfolioPreferences.yieldOnCostDividendOnly !== 'boolean') {
+        return res.status(400).json({
+          success: false,
+          error: 'yieldOnCostDividendOnly must be a boolean'
+        });
+      }
+      validPreferences.yieldOnCostDividendOnly = portfolioPreferences.yieldOnCostDividendOnly;
+    }
+
+    if (portfolioPreferences.hasOwnProperty('includeClosedPositions')) {
+      if (typeof portfolioPreferences.includeClosedPositions !== 'boolean') {
+        return res.status(400).json({
+          success: false,
+          error: 'includeClosedPositions must be a boolean'
+        });
+      }
+      validPreferences.includeClosedPositions = portfolioPreferences.includeClosedPositions;
+    }
+
+    if (portfolioPreferences.hasOwnProperty('currencyConversion')) {
+      if (typeof portfolioPreferences.currencyConversion !== 'boolean') {
+        return res.status(400).json({
+          success: false,
+          error: 'currencyConversion must be a boolean'
+        });
+      }
+      validPreferences.currencyConversion = portfolioPreferences.currencyConversion;
+    }
+
+    // Update preferences
+    await person.updatePortfolioPreferences(validPreferences);
+    
+    const updatedPreferences = person.getPortfolioPreferences();
+    
+    logger.info(`Updated portfolio preferences for ${personName}:`, validPreferences);
+    
+    res.json({
+      success: true,
+      data: {
+        personName,
+        portfolioPreferences: updatedPreferences,
+        updatedAt: person.updatedAt
+      },
+      message: 'Portfolio preferences updated successfully'
+    });
+  } catch (error) {
+    logger.error('Error updating portfolio settings:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to update portfolio settings'
+    });
+  }
+}));
+
+// ADDED: Get all portfolio settings (for admin/overview)
+router.get('/portfolio', asyncHandler(async (req, res) => {
+  try {
+    const persons = await Person.find({ isActive: true });
+    
+    const allSettings = persons.map(person => ({
+      personName: person.personName,
+      portfolioPreferences: person.getPortfolioPreferences(),
+      updatedAt: person.updatedAt
+    }));
+    
+    res.json({
+      success: true,
+      data: allSettings
+    });
+  } catch (error) {
+    logger.error('Error getting all portfolio settings:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to get portfolio settings'
+    });
+  }
+}));
+
+// ADDED: Reset portfolio settings to defaults for a person
+router.post('/portfolio/:personName/reset', asyncHandler(async (req, res) => {
+  const { personName } = req.params;
+  
+  try {
+    const person = await Person.findOne({ personName });
+    if (!person) {
+      return res.status(404).json({
+        success: false,
+        error: 'Person not found'
+      });
+    }
+
+    // Reset to default values
+    const defaultPreferences = {
+      yieldOnCostDividendOnly: true,
+      includeClosedPositions: false,
+      currencyConversion: true
+    };
+
+    await person.updatePortfolioPreferences(defaultPreferences);
+    
+    logger.info(`Reset portfolio preferences to defaults for ${personName}`);
+    
+    res.json({
+      success: true,
+      data: {
+        personName,
+        portfolioPreferences: defaultPreferences,
+        updatedAt: person.updatedAt
+      },
+      message: 'Portfolio preferences reset to defaults'
+    });
+  } catch (error) {
+    logger.error('Error resetting portfolio settings:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to reset portfolio settings'
+    });
+  }
 }));
 
 // Validate refresh token without saving

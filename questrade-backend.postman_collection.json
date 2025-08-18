@@ -2,7 +2,7 @@
   "info": {
     "name": "Multi-Person Portfolio Manager API",
     "_postman_id": "b12d6ea7-5e6b-4b95-842a-2d148b894a79",
-    "description": "Complete collection for multi-person portfolio management backend with Questrade integration",
+    "description": "Complete collection for multi-person portfolio management backend with Questrade integration and portfolio settings",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "variable": [
@@ -198,6 +198,20 @@
           }
         },
         {
+          "name": "Portfolio summary with dividend stocks only",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/portfolio/summary?viewMode=all&aggregate=true&dividendStocksOnly=true"
+          }
+        },
+        {
+          "name": "Portfolio summary with all stocks for yield",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/portfolio/summary?viewMode=all&aggregate=true&dividendStocksOnly=false"
+          }
+        },
+        {
           "name": "Get all positions (aggregated)",
           "request": {
             "method": "GET",
@@ -235,6 +249,20 @@
           "request": {
             "method": "GET",
             "url": "{{base_url}}/api/portfolio/summary?viewMode=person&personName={{person_name}}&aggregate=true"
+          }
+        },
+        {
+          "name": "Portfolio summary (person) - dividend stocks only",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/portfolio/summary?viewMode=person&personName={{person_name}}&aggregate=true&dividendStocksOnly=true"
+          }
+        },
+        {
+          "name": "Portfolio summary (person) - all stocks for yield",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/portfolio/summary?viewMode=person&personName={{person_name}}&aggregate=true&dividendStocksOnly=false"
           }
         },
         {
@@ -285,6 +313,20 @@
           }
         },
         {
+          "name": "Portfolio summary (account) - dividend stocks only",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/portfolio/summary?viewMode=account&accountId={{account_id}}&dividendStocksOnly=true"
+          }
+        },
+        {
+          "name": "Portfolio summary (account) - all stocks for yield",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/portfolio/summary?viewMode=account&accountId={{account_id}}&dividendStocksOnly=false"
+          }
+        },
+        {
           "name": "Get positions for account",
           "request": {
             "method": "GET",
@@ -324,6 +366,60 @@
           "request": {
             "method": "GET",
             "url": "{{base_url}}/api/portfolio/positions/GLD?accountId={{account_id}}"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Portfolio Settings",
+      "item": [
+        {
+          "name": "Get portfolio settings for person",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/portfolio/settings?personName={{person_name}}"
+          }
+        },
+        {
+          "name": "Update portfolio settings",
+          "request": {
+            "method": "PUT",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"personName\": \"{{person_name}}\",\n  \"portfolioPreferences\": {\n    \"yieldOnCostDividendOnly\": true\n  }\n}"
+            },
+            "url": "{{base_url}}/api/portfolio/settings"
+          }
+        },
+        {
+          "name": "Enable yield calculation for all stocks",
+          "request": {
+            "method": "PUT",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"personName\": \"{{person_name}}\",\n  \"portfolioPreferences\": {\n    \"yieldOnCostDividendOnly\": false\n  }\n}"
+            },
+            "url": "{{base_url}}/api/portfolio/settings"
+          }
+        },
+        {
+          "name": "Enable yield calculation for dividend stocks only",
+          "request": {
+            "method": "PUT",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"personName\": \"{{person_name}}\",\n  \"portfolioPreferences\": {\n    \"yieldOnCostDividendOnly\": true\n  }\n}"
+            },
+            "url": "{{base_url}}/api/portfolio/settings"
           }
         }
       ]
@@ -430,6 +526,41 @@
           "request": {
             "method": "GET",
             "url": "{{base_url}}/api/settings/dashboard"
+          }
+        },
+        {
+          "name": "Get portfolio settings for person (settings route)",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/settings/portfolio/{{person_name}}"
+          }
+        },
+        {
+          "name": "Update portfolio settings (settings route)",
+          "request": {
+            "method": "PUT",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"portfolioPreferences\": {\n    \"yieldOnCostDividendOnly\": false\n  }\n}"
+            },
+            "url": "{{base_url}}/api/settings/portfolio/{{person_name}}"
+          }
+        },
+        {
+          "name": "Reset portfolio settings to default",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{}"
+            },
+            "url": "{{base_url}}/api/settings/portfolio/{{person_name}}/reset"
           }
         },
         {
@@ -729,6 +860,135 @@
           ]
         },
         {
+          "name": "Test Portfolio Settings",
+          "item": [
+            {
+              "name": "1. Get Default Settings",
+              "request": {
+                "method": "GET",
+                "url": "{{base_url}}/api/portfolio/settings?personName={{person_name}}"
+              }
+            },
+            {
+              "name": "2. Set Yield Calculation to All Stocks",
+              "request": {
+                "method": "PUT",
+                "header": [
+                  { "key": "Content-Type", "value": "application/json" }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"personName\": \"{{person_name}}\",\n  \"portfolioPreferences\": {\n    \"yieldOnCostDividendOnly\": false\n  }\n}"
+                },
+                "url": "{{base_url}}/api/portfolio/settings"
+              }
+            },
+            {
+              "name": "3. Test Portfolio Summary with All Stocks",
+              "request": {
+                "method": "GET",
+                "url": "{{base_url}}/api/portfolio/summary?viewMode=person&personName={{person_name}}&aggregate=true"
+              }
+            },
+            {
+              "name": "4. Set Yield Calculation to Dividend Stocks Only",
+              "request": {
+                "method": "PUT",
+                "header": [
+                  { "key": "Content-Type", "value": "application/json" }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"personName\": \"{{person_name}}\",\n  \"portfolioPreferences\": {\n    \"yieldOnCostDividendOnly\": true\n  }\n}"
+                },
+                "url": "{{base_url}}/api/portfolio/settings"
+              }
+            },
+            {
+              "name": "5. Test Portfolio Summary with Dividend Stocks Only",
+              "request": {
+                "method": "GET",
+                "url": "{{base_url}}/api/portfolio/summary?viewMode=person&personName={{person_name}}&aggregate=true"
+              }
+            },
+            {
+              "name": "6. Override Setting with Query Parameter",
+              "request": {
+                "method": "GET",
+                "url": "{{base_url}}/api/portfolio/summary?viewMode=person&personName={{person_name}}&aggregate=true&dividendStocksOnly=false"
+              }
+            },
+            {
+              "name": "7. Reset Settings to Default",
+              "request": {
+                "method": "POST",
+                "header": [
+                  { "key": "Content-Type", "value": "application/json" }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{}"
+                },
+                "url": "{{base_url}}/api/settings/portfolio/{{person_name}}/reset"
+              }
+            }
+          ]
+        },
+        {
+          "name": "Test Yield on Cost Calculations",
+          "item": [
+            {
+              "name": "1. Portfolio Summary - User Preference",
+              "request": {
+                "method": "GET",
+                "url": "{{base_url}}/api/portfolio/summary?viewMode=person&personName={{person_name}}&aggregate=true"
+              }
+            },
+            {
+              "name": "2. Portfolio Summary - Force Dividend Stocks Only",
+              "request": {
+                "method": "GET",
+                "url": "{{base_url}}/api/portfolio/summary?viewMode=person&personName={{person_name}}&aggregate=true&dividendStocksOnly=true"
+              }
+            },
+            {
+              "name": "3. Portfolio Summary - Force All Stocks",
+              "request": {
+                "method": "GET",
+                "url": "{{base_url}}/api/portfolio/summary?viewMode=person&personName={{person_name}}&aggregate=true&dividendStocksOnly=false"
+              }
+            },
+            {
+              "name": "4. Compare All Accounts - Dividend Only",
+              "request": {
+                "method": "GET",
+                "url": "{{base_url}}/api/portfolio/summary?viewMode=all&aggregate=true&dividendStocksOnly=true"
+              }
+            },
+            {
+              "name": "5. Compare All Accounts - All Stocks",
+              "request": {
+                "method": "GET",
+                "url": "{{base_url}}/api/portfolio/summary?viewMode=all&aggregate=true&dividendStocksOnly=false"
+              }
+            },
+            {
+              "name": "6. Single Account - Dividend Only",
+              "request": {
+                "method": "GET",
+                "url": "{{base_url}}/api/portfolio/summary?viewMode=account&accountId={{account_id}}&dividendStocksOnly=true"
+              }
+            },
+            {
+              "name": "7. Single Account - All Stocks",
+              "request": {
+                "method": "GET",
+                "url": "{{base_url}}/api/portfolio/summary?viewMode=account&accountId={{account_id}}&dividendStocksOnly=false"
+              }
+            }
+          ]
+        },
+        {
           "name": "Test Error Handling",
           "item": [
             {
@@ -765,6 +1025,27 @@
                 "method": "GET",
                 "url": "{{base_url}}/api/portfolio/cash-balances?viewMode=account&accountId=invalid123"
               }
+            },
+            {
+              "name": "5. Portfolio Settings Invalid Person",
+              "request": {
+                "method": "GET",
+                "url": "{{base_url}}/api/portfolio/settings?personName=InvalidPerson"
+              }
+            },
+            {
+              "name": "6. Update Settings Missing Person Name",
+              "request": {
+                "method": "PUT",
+                "header": [
+                  { "key": "Content-Type", "value": "application/json" }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"portfolioPreferences\": {\n    \"yieldOnCostDividendOnly\": false\n  }\n}"
+                },
+                "url": "{{base_url}}/api/portfolio/settings"
+              }
             }
           ]
         },
@@ -797,6 +1078,67 @@
               "request": {
                 "method": "GET",
                 "url": "{{base_url}}/api/portfolio/dividends/calendar?viewMode=all"
+              }
+            }
+          ]
+        },
+        {
+          "name": "Complete Workflow Examples",
+          "item": [
+            {
+              "name": "1. Setup New Person with Settings",
+              "request": {
+                "method": "POST",
+                "header": [
+                  { "key": "Content-Type", "value": "application/json" }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"personName\": \"TestUser\",\n  \"refreshToken\": \"test_refresh_token_here\"\n}"
+                },
+                "url": "{{base_url}}/api/persons"
+              }
+            },
+            {
+              "name": "2. Configure Portfolio Settings",
+              "request": {
+                "method": "PUT",
+                "header": [
+                  { "key": "Content-Type", "value": "application/json" }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"personName\": \"TestUser\",\n  \"portfolioPreferences\": {\n    \"yieldOnCostDividendOnly\": false\n  }\n}"
+                },
+                "url": "{{base_url}}/api/portfolio/settings"
+              }
+            },
+            {
+              "name": "3. Sync Person Data",
+              "request": {
+                "method": "POST",
+                "header": [
+                  { "key": "Content-Type", "value": "application/json" }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"fullSync\": true\n}"
+                },
+                "url": "{{base_url}}/api/sync/person/TestUser"
+              }
+            },
+            {
+              "name": "4. Get Portfolio Summary with Settings",
+              "request": {
+                "method": "GET",
+                "url": "{{base_url}}/api/portfolio/summary?viewMode=person&personName=TestUser&aggregate=true"
+              }
+            },
+            {
+              "name": "5. Compare Yield Calculations",
+              "request": {
+                "method": "GET",
+                "url": "{{base_url}}/api/portfolio/summary?viewMode=person&personName=TestUser&aggregate=true&dividendStocksOnly=true"
               }
             }
           ]

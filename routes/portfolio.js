@@ -1,4 +1,4 @@
-// routes/portfolio.js - FIXED VERSION - Enhanced cash balance endpoint
+// routes/portfolio.js - ENHANCED VERSION - Added portfolio settings support
 const express = require('express');
 const router = express.Router();
 const portfolioCalculator = require('../services/portfolioCalculator');
@@ -9,19 +9,157 @@ const Account = require('../models/Account');
 const Symbol = require('../models/Symbol');
 const Activity = require('../models/Activity');
 const PortfolioSnapshot = require('../models/PortfolioSnapshot');
+const Person = require('../models/Person'); // ADDED for settings
 const logger = require('../utils/logger');
 const { asyncHandler } = require('../middleware/errorHandler');
 
-// Get portfolio summary with aggregation support
+// ADDED: Get portfolio settings for a person
+router.get('/settings', asyncHandler(async (req, res) => {
+  const { personName } = req.query;
+  
+  if (!personName) {
+    return res.status(400).json({
+      success: false,
+      error: 'personName is required'
+    });
+  }
+
+  try {
+    const person = await Person.findOne({ personName });
+    if (!person) {
+      return res.status(404).json({
+        success: false,
+        error: 'Person not found'
+      });
+    }
+
+    const portfolioPreferences = person.getPortfolioPreferences();
+    
+    res.json({
+      success: true,
+      data: {
+        personName,
+        portfolioPreferences,
+        updatedAt: person.updatedAt
+      }
+    });
+  } catch (error) {
+    logger.error('Error getting portfolio settings:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to get portfolio settings'
+    });
+  }
+}));
+
+// ADDED: Update portfolio settings for a person
+router.put('/settings', asyncHandler(async (req, res) => {
+  const { personName, portfolioPreferences } = req.body;
+  
+  if (!personName) {
+    return res.status(400).json({
+      success: false,
+      error: 'personName is required'
+    });
+  }
+
+  if (!portfolioPreferences || typeof portfolioPreferences !== 'object') {
+    return res.status(400).json({
+      success: false,
+      error: 'portfolioPreferences object is required'
+    });
+  }
+
+  try {
+    const person = await Person.findOne({ personName });
+    if (!person) {
+      return res.status(404).json({
+        success: false,
+        error: 'Person not found'
+      });
+    }
+
+    // Validate preference values
+    const validPreferences = {};
+    if (portfolioPreferences.hasOwnProperty('yieldOnCostDividendOnly')) {
+      if (typeof portfolioPreferences.yieldOnCostDividendOnly !== 'boolean') {
+        return res.status(400).json({
+          success: false,
+          error: 'yieldOnCostDividendOnly must be a boolean'
+        });
+      }
+      validPreferences.yieldOnCostDividendOnly = portfolioPreferences.yieldOnCostDividendOnly;
+    }
+
+    if (portfolioPreferences.hasOwnProperty('includeClosedPositions')) {
+      if (typeof portfolioPreferences.includeClosedPositions !== 'boolean') {
+        return res.status(400).json({
+          success: false,
+          error: 'includeClosedPositions must be a boolean'
+        });
+      }
+      validPreferences.includeClosedPositions = portfolioPreferences.includeClosedPositions;
+    }
+
+    if (portfolioPreferences.hasOwnProperty('currencyConversion')) {
+      if (typeof portfolioPreferences.currencyConversion !== 'boolean') {
+        return res.status(400).json({
+          success: false,
+          error: 'currencyConversion must be a boolean'
+        });
+      }
+      validPreferences.currencyConversion = portfolioPreferences.currencyConversion;
+    }
+
+    // Update preferences
+    await person.updatePortfolioPreferences(validPreferences);
+    
+    const updatedPreferences = person.getPortfolioPreferences();
+    
+    logger.info(`Updated portfolio preferences for ${personName}:`, validPreferences);
+    
+    res.json({
+      success: true,
+      data: {
+        personName,
+        portfolioPreferences: updatedPreferences,
+        updatedAt: person.updatedAt
+      },
+      message: 'Portfolio preferences updated successfully'
+    });
+  } catch (error) {
+    logger.error('Error updating portfolio settings:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to update portfolio settings'
+    });
+  }
+}));
+
+// ENHANCED: Get portfolio summary with aggregation support and yield calculation options
 router.get('/summary', asyncHandler(async (req, res) => {
-  const { viewMode = 'account', personName, accountId, aggregate = 'false' } = req.query;
+  const { 
+    viewMode = 'account', 
+    personName, 
+    accountId, 
+    aggregate = 'false',
+    dividendStocksOnly = null // ADDED: New query parameter
+  } = req.query;
 
   try {
     let summary;
 
+    // Parse dividendStocksOnly parameter
+    let useDividendStocksOnly = null;
+    if (dividendStocksOnly !== null) {
+      useDividendStocksOnly = dividendStocksOnly === 'true';
+    }
+
+    const options = { dividendStocksOnly: useDividendStocksOnly };
+
     if (aggregate === 'true' || viewMode !== 'account') {
-      // Use aggregation service
-      summary = await accountAggregator.getAggregatedSummary(viewMode, personName, accountId);
+      // Use aggregation service with yield calculation options
+      summary = await accountAggregator.getAggregatedSummary(viewMode, personName, accountId, options);
     } else {
       // Use legacy calculator for single account
       summary = await portfolioCalculator.getPortfolioSummary(accountId);

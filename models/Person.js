@@ -1,4 +1,4 @@
-// models/Person.js
+// models/Person.js - ENHANCED VERSION - Portfolio calculation preferences
 const mongoose = require('mongoose');
 
 const personSchema = new mongoose.Schema({
@@ -39,6 +39,25 @@ const personSchema = new mongoose.Schema({
       syncErrors: {
         type: Boolean,
         default: true
+      }
+    },
+    // ADDED: Portfolio calculation preferences
+    portfolio: {
+      yieldOnCostDividendOnly: {
+        type: Boolean,
+        default: true,
+        description: 'Calculate yield on cost using only dividend-paying stocks'
+      },
+      includeClosedPositions: {
+        type: Boolean,
+        default: false,
+        description: 'Include closed positions in portfolio calculations'
+      },
+      // Future extension possibilities
+      currencyConversion: {
+        type: Boolean,
+        default: true,
+        description: 'Convert multi-currency positions to base currency'
       }
     }
   },
@@ -88,5 +107,28 @@ personSchema.pre('save', function(next) {
 
 // Index for efficient queries
 personSchema.index({ personName: 1, isActive: 1 });
+
+// ADDED: Helper methods for portfolio preferences
+personSchema.methods.getPortfolioPreferences = function() {
+  return this.preferences?.portfolio || {
+    yieldOnCostDividendOnly: true,
+    includeClosedPositions: false,
+    currencyConversion: true
+  };
+};
+
+personSchema.methods.updatePortfolioPreferences = async function(newPreferences) {
+  if (!this.preferences) {
+    this.preferences = {};
+  }
+  if (!this.preferences.portfolio) {
+    this.preferences.portfolio = {};
+  }
+  
+  // Update only provided preferences
+  Object.assign(this.preferences.portfolio, newPreferences);
+  this.markModified('preferences.portfolio');
+  return await this.save();
+};
 
 module.exports = mongoose.model('Person', personSchema);

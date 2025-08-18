@@ -1,10 +1,10 @@
-// services/accountAggregator.js - FIXED VERSION - Properly handles totalReceived in dividend aggregation
+// services/accountAggregator.js - ENHANCED VERSION - Yield calculation with dividend-only option
 const Position = require('../models/Position');
 const Activity = require('../models/Activity');
 const Account = require('../models/Account');
 const Symbol = require('../models/Symbol');
-const logger = require('../utils/logger');
 const Person = require('../models/Person');
+const logger = require('../utils/logger');
 
 class AccountAggregator {
   
@@ -289,13 +289,24 @@ class AccountAggregator {
     }
   }
 
-// Get portfolio summary with aggregation and enhanced currency support
-  async getAggregatedSummary(viewMode, personName = null, accountId = null) {
+  // ENHANCED: Get portfolio summary with yield calculation options
+  async getAggregatedSummary(viewMode, personName = null, accountId = null, options = {}) {
     try {
+      const { dividendStocksOnly = null } = options;
+      
       const positions = await this.aggregatePositions(viewMode, personName, accountId);
       
       if (positions.length === 0) {
         return null;
+      }
+
+      // Get user preferences for yield calculation if not explicitly specified
+      let useDividendStocksOnly = dividendStocksOnly;
+      if (useDividendStocksOnly === null && personName) {
+        const person = await Person.findOne({ personName });
+        useDividendStocksOnly = person?.getPortfolioPreferences?.()?.yieldOnCostDividendOnly ?? true;
+      } else if (useDividendStocksOnly === null) {
+        useDividendStocksOnly = true; // Default to dividend stocks only
       }
 
       // Get accounts for additional data
@@ -323,14 +334,22 @@ class AccountAggregator {
       let monthlyDividendIncome = 0;
       let annualProjectedDividend = 0;
       
+      // ENHANCED: Separate calculations for yield on cost
+      let yieldCalculationInvestment = 0;
+      let yieldCalculationDividends = 0;
+      
       const sectorMap = {};
       const currencyMap = {};
       const personMap = {};
 
       positions.forEach(position => {
-        totalInvestment += position.totalCost || 0;
-        currentValue += position.currentMarketValue || 0;
-        unrealizedPnl += position.openPnl || 0;
+        const positionValue = position.currentMarketValue || 0;
+        const positionCost = position.totalCost || 0;
+        const positionPnl = position.openPnl || 0;
+        
+        totalInvestment += positionCost;
+        currentValue += positionValue;
+        unrealizedPnl += positionPnl;
         
         if (position.dividendData) {
           totalDividends += position.dividendData.totalReceived || 0; // FIXED: Use totalReceived for actual dividends received
@@ -338,24 +357,45 @@ class AccountAggregator {
           annualProjectedDividend += position.dividendData.annualDividend || 0;
         }
         
+        // ENHANCED: Calculate yield basis based on preference
+        if (useDividendStocksOnly) {
+          // Only include dividend-paying stocks in yield calculation
+          if (position.isDividendStock && position.dividendData && position.dividendData.annualDividend > 0) {
+            yieldCalculationInvestment += positionCost;
+            yieldCalculationDividends += position.dividendData.annualDividend || 0;
+          }
+        } else {
+          // Include all stocks in yield calculation
+          yieldCalculationInvestment += positionCost;
+          yieldCalculationDividends += position.dividendData?.annualDividend || 0;
+        }
+        
         // Sector allocation
         const sector = position.industrySector || position.securityType || 'Other';
-        sectorMap[sector] = (sectorMap[sector] || 0) + (position.currentMarketValue || 0);
+        sectorMap[sector] = (sectorMap[sector] || 0) + positionValue;
         
         // Currency allocation
         const currency = position.currency || 'CAD';
-        currencyMap[currency] = (currencyMap[currency] || 0) + (position.currentMarketValue || 0);
+        currencyMap[currency] = (currencyMap[currency] || 0) + positionValue;
         
         // Person allocation (for "all" view)
         if (viewMode === 'all' && position.personName !== 'Multiple') {
-          personMap[position.personName] = (personMap[position.personName] || 0) + (position.currentMarketValue || 0);
+          personMap[position.personName] = (personMap[position.personName] || 0) + positionValue;
         }
       });
 
       const totalReturnValue = unrealizedPnl + totalDividends; // FIXED: totalDividends is now actual dividends received
       const totalReturnPercent = totalInvestment > 0 ? (totalReturnValue / totalInvestment) * 100 : 0;
       const averageYieldPercent = currentValue > 0 ? (annualProjectedDividend / currentValue) * 100 : 0;
-      const yieldOnCostPercent = totalInvestment > 0 ? (annualProjectedDividend / totalInvestment) * 100 : 0;
+      
+      // ENHANCED: Calculate yield on cost based on preference
+      const yieldOnCostPercent = yieldCalculationInvestment > 0 ? 
+        (yieldCalculationDividends / yieldCalculationInvestment) * 100 : 0;
+
+      // Count dividend stocks for summary
+      const dividendStockCount = positions.filter(p => 
+        p.dividendData && p.dividendData.annualDividend > 0
+      ).length;
 
       // Format allocations
       const sectorAllocation = Object.entries(sectorMap).map(([sector, value]) => ({
@@ -439,12 +479,10 @@ class AccountAggregator {
         monthlyDividendIncome,
         annualProjectedDividend,
         averageYieldPercent,
-        yieldOnCostPercent,
+        yieldOnCostPercent, // ENHANCED: Now calculated based on user preference
         numberOfPositions: positions.length,
         numberOfAccounts: accountIds.size,
-        numberOfDividendStocks: positions.filter(p => 
-          p.dividendData && p.dividendData.annualDividend > 0
-        ).length,
+        numberOfDividendStocks: dividendStockCount,
         sectorAllocation,
         currencyBreakdown,
         personBreakdown: viewMode === 'all' ? personBreakdown : [],
@@ -452,6 +490,14 @@ class AccountAggregator {
         aggregationInfo: {
           hasAggregatedPositions: positions.some(p => p.isAggregated),
           totalAggregatedSymbols: positions.filter(p => p.isAggregated).length
+        },
+        // ENHANCED: Yield calculation metadata
+        yieldCalculationInfo: {
+          useDividendStocksOnly,
+          yieldCalculationInvestment,
+          yieldCalculationDividends,
+          dividendStockCount,
+          totalPositionCount: positions.length
         }
       };
     } catch (error) {
@@ -459,7 +505,6 @@ class AccountAggregator {
       throw error;
     }
   }
-
 
   // Enrich positions with additional symbol information - FIXED
   async enrichPositions(positions) {
