@@ -1,4 +1,4 @@
-// services/accountAggregator.js - FIXED VERSION - Properly handles totalReceived in dividend aggregation
+// services/accountAggregator.js - Fixed to properly aggregate totalReceived from dividend data
 const Position = require('../models/Position');
 const Activity = require('../models/Activity');
 const Account = require('../models/Account');
@@ -82,7 +82,7 @@ class AccountAggregator {
     }
   }
 
-  // FIXED: Aggregate multiple positions of the same symbol with proper totalReceived calculation
+  // Aggregate multiple positions of the same symbol - FIXED to properly sum totalReceived
   async aggregateSymbolPositions(symbol, positions, accountMap = {}) {
     try {
       // Get symbol info for the aggregated position
@@ -92,11 +92,12 @@ class AccountAggregator {
       let totalShares = 0;
       let totalCost = 0;
       let totalMarketValue = 0;
-      let totalDividendsReceived = 0; // FIXED: Initialize properly
+      let totalDividendsReceived = 0; // IMPORTANT: Initialize to 0
       let totalMonthlyDividend = 0;
       let totalAnnualDividend = 0;
       let totalOpenPnl = 0;
       let totalDayPnl = 0;
+      let totalClosedPnl = 0;
       
       const sourceAccounts = [];
       const personNames = new Set();
@@ -104,16 +105,19 @@ class AccountAggregator {
       let latestMarketData = null;
       let latestSyncedAt = null;
 
-      // FIXED: Track dividend per share from positions (use the most common/recent value)
+      // Track dividend information
+      let lastDividendDate = null;
+      let lastDividendAmount = 0;
       const dividendPerShareValues = [];
 
-      // FIXED: Aggregate values from all positions including totalReceived
+      // Aggregate values from all positions
       positions.forEach(position => {
         totalShares += position.openQuantity || 0;
         totalCost += position.totalCost || 0;
         totalMarketValue += position.currentMarketValue || 0;
         totalOpenPnl += position.openPnl || 0;
         totalDayPnl += position.dayPnl || 0;
+        totalClosedPnl += position.closedPnl || 0;
         
         sourceAccounts.push(position.accountId);
         personNames.add(position.personName);
@@ -125,35 +129,58 @@ class AccountAggregator {
           latestSyncedAt = position.syncedAt;
         }
         
-        // FIXED: Aggregate dividend data including totalReceived
+        // CRITICAL FIX: Properly aggregate dividend data including totalReceived
         if (position.dividendData) {
-          totalDividendsReceived += position.dividendData.totalReceived || 0; // FIXED: Properly aggregate totalReceived
+          // Sum up the actual dividends received
+          totalDividendsReceived += position.dividendData.totalReceived || 0;
           totalMonthlyDividend += position.dividendData.monthlyDividend || 0;
           totalAnnualDividend += position.dividendData.annualDividend || 0;
+          
+          // Track last dividend info (use most recent)
+          if (position.dividendData.lastDividendDate) {
+            if (!lastDividendDate || new Date(position.dividendData.lastDividendDate) > new Date(lastDividendDate)) {
+              lastDividendDate = position.dividendData.lastDividendDate;
+              lastDividendAmount = position.dividendData.lastDividendAmount || 0;
+            }
+          }
         }
 
-        // FIXED: Collect dividendPerShare values from positions
+        // Collect dividendPerShare values from positions
         if (position.dividendPerShare && position.dividendPerShare > 0) {
           dividendPerShareValues.push(position.dividendPerShare);
         }
       });
 
+      // Log aggregation for debugging
+      if (totalDividendsReceived > 0) {
+        logger.info(`Aggregating ${symbol}: ${positions.length} positions, totalReceived: $${totalDividendsReceived.toFixed(2)}`);
+      }
+
       // Calculate aggregated metrics
       const weightedAverageCost = totalShares > 0 ? totalCost / totalShares : 0;
-      const totalReturnValue = totalOpenPnl + totalDividendsReceived; // FIXED: Use actual totalDividendsReceived
+      const totalReturnValue = totalOpenPnl + totalDividendsReceived; // Include actual dividends received
       const totalReturnPercent = totalCost > 0 ? (totalReturnValue / totalCost) * 100 : 0;
       const capitalGainPercent = totalCost > 0 ? (totalOpenPnl / totalCost) * 100 : 0;
+      const capitalGainValue = totalOpenPnl;
       
-      // FIXED: Dividend metrics using actual totalDividendsReceived
+      // Dividend metrics using actual totalDividendsReceived
       const dividendReturnPercent = totalCost > 0 ? (totalDividendsReceived / totalCost) * 100 : 0;
-      const yieldOnCost = weightedAverageCost > 0 && totalShares > 0
-        ? ((totalAnnualDividend / totalShares) / weightedAverageCost) * 100
+      const yieldOnCost = totalCost > 0 && totalAnnualDividend > 0 
+        ? (totalAnnualDividend / totalCost) * 100 
         : 0;
 
-      // FIXED: Calculate dividendPerShare more intelligently
+      // Calculate dividend-adjusted cost
+      let dividendAdjustedCostPerShare = weightedAverageCost;
+      let dividendAdjustedCost = totalCost;
+      
+      if (totalDividendsReceived > 0 && totalShares > 0) {
+        dividendAdjustedCostPerShare = Math.max(0, weightedAverageCost - (totalDividendsReceived / totalShares));
+        dividendAdjustedCost = dividendAdjustedCostPerShare * totalShares;
+      }
+
+      // Calculate aggregated dividendPerShare
       let aggregatedDividendPerShare = 0;
       
-      // First, try to use values from positions
       if (dividendPerShareValues.length > 0) {
         // Use the most common value, or if tied, the highest value
         const valueCount = {};
@@ -161,10 +188,8 @@ class AccountAggregator {
           valueCount[val] = (valueCount[val] || 0) + 1;
         });
         
-        // Get the most frequent value
         const sortedValues = Object.entries(valueCount)
           .sort((a, b) => {
-            // Sort by frequency first, then by value (descending)
             if (b[1] !== a[1]) return b[1] - a[1];
             return parseFloat(b[0]) - parseFloat(a[0]);
           });
@@ -177,21 +202,7 @@ class AccountAggregator {
         const freq = symbolInfo.dividendFrequency?.toLowerCase();
         if (freq === 'monthly' || freq === 'quarterly') {
           aggregatedDividendPerShare = symbolInfo.dividendPerShare || symbolInfo.dividend || 0;
-        } else {
-          aggregatedDividendPerShare = 0;
         }
-      }
-
-      // FIXED: When dividends have been received, adjust cost appropriately
-      let dividendAdjustedCostPerShare;
-      let dividendAdjustedCost;
-
-      if (totalDividendsReceived > 0 && totalShares > 0) {
-        dividendAdjustedCostPerShare = Math.max(0, weightedAverageCost - (totalDividendsReceived / totalShares));
-        dividendAdjustedCost = dividendAdjustedCostPerShare * totalShares;
-      } else {
-        dividendAdjustedCostPerShare = totalShares > 0 ? weightedAverageCost : null;
-        dividendAdjustedCost = totalCost > 0 ? totalCost : null;
       }
 
       // Map each account's individual position for client display
@@ -205,14 +216,16 @@ class AccountAggregator {
           avgCost: pos.averageEntryPrice,
           marketValue: pos.currentMarketValue,
           totalCost: pos.totalCost,
-          openPnl: pos.openPnl
+          openPnl: pos.openPnl,
+          // Include dividend info for transparency
+          dividendsReceived: pos.dividendData?.totalReceived || 0
         };
       });
 
-      // FIXED: Determine if this is actually a dividend stock based on regular dividends
+      // Determine if this is a dividend stock
       const isDividendStock = totalAnnualDividend > 0 ||
                              aggregatedDividendPerShare > 0 ||
-                             totalDividendsReceived > 0; // FIXED: Also check if dividends have been received
+                             totalDividendsReceived > 0;
 
       // Create aggregated position
       const aggregatedPosition = {
@@ -232,17 +245,19 @@ class AccountAggregator {
         // Aggregated P&L
         openPnl: totalOpenPnl,
         dayPnl: totalDayPnl,
-        closedPnl: 0,
+        closedPnl: totalClosedPnl,
         
         // Calculated fields
         totalReturnPercent,
         totalReturnValue,
         capitalGainPercent,
-        capitalGainValue: totalOpenPnl,
+        capitalGainValue,
         
-        // FIXED: Aggregated dividend data with proper totalReceived
+        // CRITICAL: Properly aggregated dividend data with actual totalReceived
         dividendData: {
-          totalReceived: totalDividendsReceived, // FIXED: Use aggregated totalDividendsReceived
+          totalReceived: totalDividendsReceived, // This is now the sum of all actual dividends received
+          lastDividendAmount: lastDividendAmount,
+          lastDividendDate: lastDividendDate,
           dividendReturnPercent,
           yieldOnCost,
           dividendAdjustedCost,
@@ -251,8 +266,7 @@ class AccountAggregator {
           monthlyDividendPerShare: totalShares > 0 ? totalMonthlyDividend / totalShares : 0,
           annualDividend: totalAnnualDividend,
           annualDividendPerShare: totalShares > 0 ? totalAnnualDividend / totalShares : 0,
-          lastDividendDate: this.getLatestDividendDate(positions),
-          lastDividendAmount: this.getLatestDividendAmount(positions)
+          dividendFrequency: this.estimateDividendFrequency(positions)
         },
         
         // Market data (use latest)
@@ -268,19 +282,14 @@ class AccountAggregator {
         syncedAt: latestSyncedAt,
         updatedAt: new Date(),
         
-        // FIXED: Use properly calculated dividend per share
+        // Additional fields
         dividendPerShare: aggregatedDividendPerShare,
-        industrySector: symbolInfo?.industrySector,
-        industryGroup: symbolInfo?.industryGroup,
-        currency: symbolInfo?.currency || positions[0]?.currency,
-        securityType: symbolInfo?.securityType,
+        industrySector: symbolInfo?.industrySector || positions[0]?.industrySector,
+        industryGroup: symbolInfo?.industryGroup || positions[0]?.industryGroup,
+        currency: symbolInfo?.currency || positions[0]?.currency || 'CAD',
+        securityType: symbolInfo?.securityType || positions[0]?.securityType || 'Stock',
         isDividendStock
       };
-
-      // FIXED: Log aggregation details for debugging
-      if (totalDividendsReceived > 0) {
-        logger.debug(`Aggregated ${symbol}: totalReceived=${totalDividendsReceived.toFixed(2)}, positions=${positions.length}`);
-      }
 
       return aggregatedPosition;
     } catch (error) {
@@ -289,13 +298,34 @@ class AccountAggregator {
     }
   }
 
-// Get portfolio summary with aggregation and enhanced currency support
+  // Get portfolio summary with aggregation
   async getAggregatedSummary(viewMode, personName = null, accountId = null) {
     try {
       const positions = await this.aggregatePositions(viewMode, personName, accountId);
       
       if (positions.length === 0) {
-        return null;
+        return {
+          viewMode,
+          personName,
+          accountId,
+          totalInvestment: 0,
+          currentValue: 0,
+          totalReturnValue: 0,
+          totalReturnPercent: 0,
+          unrealizedPnl: 0,
+          totalDividends: 0,
+          monthlyDividendIncome: 0,
+          annualProjectedDividend: 0,
+          averageYieldPercent: 0,
+          yieldOnCostPercent: 0,
+          numberOfPositions: 0,
+          numberOfAccounts: 0,
+          numberOfDividendStocks: 0,
+          sectorAllocation: [],
+          currencyBreakdown: [],
+          personBreakdown: [],
+          accounts: []
+        };
       }
 
       // Get accounts for additional data
@@ -319,7 +349,7 @@ class AccountAggregator {
       let totalInvestment = 0;
       let currentValue = 0;
       let unrealizedPnl = 0;
-      let totalDividends = 0; // FIXED: This should be total dividends received
+      let totalDividends = 0; // This will be actual dividends received
       let monthlyDividendIncome = 0;
       let annualProjectedDividend = 0;
       
@@ -332,8 +362,9 @@ class AccountAggregator {
         currentValue += position.currentMarketValue || 0;
         unrealizedPnl += position.openPnl || 0;
         
+        // CRITICAL FIX: Use totalReceived for actual dividends received
         if (position.dividendData) {
-          totalDividends += position.dividendData.totalReceived || 0; // FIXED: Use totalReceived for actual dividends received
+          totalDividends += position.dividendData.totalReceived || 0; // Actual dividends received
           monthlyDividendIncome += position.dividendData.monthlyDividend || 0;
           annualProjectedDividend += position.dividendData.annualDividend || 0;
         }
@@ -352,7 +383,12 @@ class AccountAggregator {
         }
       });
 
-      const totalReturnValue = unrealizedPnl + totalDividends; // FIXED: totalDividends is now actual dividends received
+      // Log summary for debugging
+      if (totalDividends > 0) {
+        logger.info(`Portfolio summary: ${positions.length} positions, totalDividends: $${totalDividends.toFixed(2)}`);
+      }
+
+      const totalReturnValue = unrealizedPnl + totalDividends; // Include actual dividends in total return
       const totalReturnPercent = totalInvestment > 0 ? (totalReturnValue / totalInvestment) * 100 : 0;
       const averageYieldPercent = currentValue > 0 ? (annualProjectedDividend / currentValue) * 100 : 0;
       const yieldOnCostPercent = totalInvestment > 0 ? (annualProjectedDividend / totalInvestment) * 100 : 0;
@@ -362,22 +398,22 @@ class AccountAggregator {
         sector,
         value,
         percentage: currentValue > 0 ? (value / currentValue) * 100 : 0
-      }));
+      })).sort((a, b) => b.value - a.value);
 
       const currencyBreakdown = Object.entries(currencyMap).map(([currency, value]) => ({
         currency,
         value,
         percentage: currentValue > 0 ? (value / currentValue) * 100 : 0
-      }));
+      })).sort((a, b) => b.value - a.value);
 
       const personBreakdown = Object.entries(personMap).map(([person, value]) => ({
         personName: person,
         value,
         percentage: currentValue > 0 ? (value / currentValue) * 100 : 0,
         numberOfPositions: positions.filter(p => p.personName === person).length
-      }));
+      })).sort((a, b) => b.value - a.value);
 
-      // Enhanced accounts summary with currency information
+      // Enhanced accounts summary
       const accountsSummary = accounts.map(account => {
         const accountPositions = positions.filter(p => 
           p.isAggregated ? p.sourceAccounts?.includes(account.accountId) : p.accountId === account.accountId
@@ -386,29 +422,18 @@ class AccountAggregator {
         const accountValue = accountPositions.reduce((sum, p) => sum + (p.currentMarketValue || 0), 0);
         const accountInvestment = accountPositions.reduce((sum, p) => sum + (p.totalCost || 0), 0);
         const accountPnl = accountPositions.reduce((sum, p) => sum + (p.openPnl || 0), 0);
+        const accountDividends = accountPositions.reduce((sum, p) => sum + (p.dividendData?.totalReceived || 0), 0);
         
-        // Get cash balance and currency from account
-        let cashBalance = 0;
-        let currency = 'CAD';
-        
-        if (account.balances && account.balances.combinedBalances) {
-          const balance = account.balances.combinedBalances;
-          cashBalance = balance.cash || 0;
-          currency = balance.currency || 'CAD';
-        }
-
         return {
           accountId: account.accountId,
           accountName: account.displayName || `${account.type} - ${account.accountId}`,
           accountType: account.type,
-          currency: currency,
           totalInvestment: accountInvestment,
           currentValue: accountValue,
           unrealizedPnl: accountPnl,
-          cashBalance: cashBalance,
+          dividendsReceived: accountDividends,
           numberOfPositions: accountPositions.length,
-          returnPercent: accountInvestment > 0 ? (accountPnl / accountInvestment) * 100 : 0,
-          lastUpdated: account.syncedAt
+          returnPercent: accountInvestment > 0 ? ((accountPnl + accountDividends) / accountInvestment) * 100 : 0
         };
       });
 
@@ -422,20 +447,16 @@ class AccountAggregator {
         }
       });
 
-      // Determine primary currency (most common currency in positions)
-      const primaryCurrency = Object.entries(currencyMap).sort((a, b) => b[1] - a[1])[0]?.[0] || 'CAD';
-
       return {
         viewMode,
         personName,
         accountId,
-        currency: primaryCurrency,
         totalInvestment,
         currentValue,
         totalReturnValue,
         totalReturnPercent,
         unrealizedPnl,
-        totalDividends, // FIXED: This is now actual dividends received
+        totalDividends, // Now properly shows actual dividends received
         monthlyDividendIncome,
         annualProjectedDividend,
         averageYieldPercent,
@@ -443,12 +464,12 @@ class AccountAggregator {
         numberOfPositions: positions.length,
         numberOfAccounts: accountIds.size,
         numberOfDividendStocks: positions.filter(p => 
-          p.dividendData && p.dividendData.annualDividend > 0
+          p.dividendData && (p.dividendData.annualDividend > 0 || p.dividendData.totalReceived > 0)
         ).length,
         sectorAllocation,
         currencyBreakdown,
         personBreakdown: viewMode === 'all' ? personBreakdown : [],
-        accounts: accountsSummary, // Enhanced accounts array with currency info
+        accounts: accountsSummary,
         aggregationInfo: {
           hasAggregatedPositions: positions.some(p => p.isAggregated),
           totalAggregatedSymbols: positions.filter(p => p.isAggregated).length
@@ -460,8 +481,7 @@ class AccountAggregator {
     }
   }
 
-
-  // Enrich positions with additional symbol information - FIXED
+  // Enrich positions with additional symbol information
   async enrichPositions(positions) {
     try {
       const symbolIds = [...new Set(positions.map(p => p.symbolId))];
@@ -471,12 +491,13 @@ class AccountAggregator {
 
       return positions.map(position => {
         const symbolInfo = symbolMap[position.symbolId];
+        
+        // Keep all existing dividend data intact
         const actualDividendData = position.dividendData || {};
         
-        // FIXED: Prioritize existing dividendPerShare from position data
+        // Determine dividendPerShare
         let dividendPerShare = position.dividendPerShare || 0;
         
-        // If position doesn't have dividendPerShare, try symbol data
         if (dividendPerShare === 0 && symbolInfo) {
           const freq = symbolInfo.dividendFrequency?.toLowerCase();
           if (freq === 'monthly' || freq === 'quarterly') {
@@ -484,30 +505,22 @@ class AccountAggregator {
           }
         }
         
-        // Check for regular dividend payments or if dividends have been received
-        const hasRegularDividends =
-          (actualDividendData.dividendFrequency === 12 || actualDividendData.dividendFrequency === 4) &&
-          ((actualDividendData.annualDividend || 0) > 0 ||
-           (actualDividendData.monthlyDividend || 0) > 0);
-
-        const hasActualDividends = hasRegularDividends || 
-                                  dividendPerShare > 0 || 
-                                  (actualDividendData.totalReceived || 0) > 0; // FIXED: Check if dividends have been received
-
-        
-        // Enhanced logic for isDividendStock
-        const isDividendStock = hasActualDividends;
+        // Check if this is a dividend stock based on actual data
+        const isDividendStock = (actualDividendData.annualDividend > 0) ||
+                               (actualDividendData.totalReceived > 0) ||
+                               dividendPerShare > 0;
         
         return {
           ...position,
-          // FIXED: Always preserve the calculated dividendPerShare value
           dividendPerShare: isDividendStock ? dividendPerShare : 0,
           industrySector: position.industrySector || symbolInfo?.industrySector,
           industryGroup: position.industryGroup || symbolInfo?.industryGroup,
           industrySubGroup: symbolInfo?.industrySubGroup,
-          currency: position.currency || symbolInfo?.currency,
-          securityType: symbolInfo?.securityType,
-          isDividendStock
+          currency: position.currency || symbolInfo?.currency || 'CAD',
+          securityType: symbolInfo?.securityType || position.securityType,
+          isDividendStock,
+          // Preserve the actual dividend data
+          dividendData: actualDividendData
         };
       });
     } catch (error) {
@@ -516,32 +529,24 @@ class AccountAggregator {
     }
   }
 
-  // Helper method to get latest dividend date from positions
-  getLatestDividendDate(positions) {
-    let latestDate = null;
-    positions.forEach(position => {
-      if (position.dividendData?.lastDividendDate) {
-        if (!latestDate || position.dividendData.lastDividendDate > latestDate) {
-          latestDate = position.dividendData.lastDividendDate;
-        }
-      }
+  // Helper method to estimate dividend frequency
+  estimateDividendFrequency(positions) {
+    const frequencies = positions
+      .map(p => p.dividendData?.dividendFrequency)
+      .filter(f => f && f > 0);
+    
+    if (frequencies.length === 0) return 0;
+    
+    // Return the most common frequency
+    const frequencyCount = {};
+    frequencies.forEach(f => {
+      frequencyCount[f] = (frequencyCount[f] || 0) + 1;
     });
-    return latestDate;
-  }
-
-  // Helper method to get latest dividend amount from positions
-  getLatestDividendAmount(positions) {
-    let latestAmount = 0;
-    let latestDate = null;
-    positions.forEach(position => {
-      if (position.dividendData?.lastDividendDate) {
-        if (!latestDate || position.dividendData.lastDividendDate > latestDate) {
-          latestDate = position.dividendData.lastDividendDate;
-          latestAmount = position.dividendData.lastDividendAmount || 0;
-        }
-      }
-    });
-    return latestAmount;
+    
+    const sortedFrequencies = Object.entries(frequencyCount)
+      .sort((a, b) => b[1] - a[1]);
+    
+    return parseInt(sortedFrequencies[0][0]);
   }
 
   // Get account dropdown options

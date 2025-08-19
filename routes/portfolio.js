@@ -1,4 +1,4 @@
-// routes/portfolio.js - FIXED VERSION - Enhanced cash balance endpoint
+// routes/portfolio.js - FIXED VERSION - Enhanced cash balance and dividend recalculation endpoints
 const express = require('express');
 const router = express.Router();
 const portfolioCalculator = require('../services/portfolioCalculator');
@@ -9,6 +9,7 @@ const Account = require('../models/Account');
 const Symbol = require('../models/Symbol');
 const Activity = require('../models/Activity');
 const PortfolioSnapshot = require('../models/PortfolioSnapshot');
+const DividendCalculator = require('../services/dataSync/dividendCalculator');
 const logger = require('../utils/logger');
 const { asyncHandler } = require('../middleware/errorHandler');
 
@@ -45,6 +46,7 @@ router.get('/positions', asyncHandler(async (req, res) => {
   const { viewMode = 'account', personName, accountId, aggregate = 'false' } = req.query;
 
   try {
+    let positions;
     let accountInfo = null;
 
     if (aggregate === 'true' || viewMode !== 'account') {
@@ -324,6 +326,126 @@ router.post('/cash-balances/refresh', asyncHandler(async (req, res) => {
     res.status(500).json({
       success: false,
       error: 'Failed to refresh cash balances',
+      details: error.message
+    });
+  }
+}));
+
+// NEW: Recalculate dividends endpoint
+router.post('/dividends/recalculate', asyncHandler(async (req, res) => {
+  const { personName, symbol, dryRun = false } = req.body;
+
+  try {
+    logger.info(`Starting dividend recalculation${personName ? ` for ${personName}` : ''}${symbol ? ` for symbol ${symbol}` : ''}`);
+
+    const dividendCalculator = new DividendCalculator();
+    let query = {};
+    
+    if (personName) {
+      query.personName = personName;
+    }
+    
+    if (symbol) {
+      query.symbol = symbol;
+    }
+
+    // Get positions to recalculate
+    const positions = await Position.find(query);
+    
+    if (positions.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: 'No positions found matching criteria'
+      });
+    }
+
+    logger.info(`Found ${positions.length} positions to recalculate`);
+
+    let updated = 0;
+    let errors = [];
+    const updates = [];
+
+    // Get symbols data for batch lookup
+    const symbolIds = [...new Set(positions.map(p => p.symbolId))];
+    const symbols = await Symbol.find({ symbolId: { $in: symbolIds } }).lean();
+    const symbolMap = {};
+    symbols.forEach(sym => { symbolMap[sym.symbolId] = sym; });
+
+    for (const position of positions) {
+      try {
+        const symbolInfo = symbolMap[position.symbolId];
+        
+        // Recalculate dividend data
+        const newDividendData = await dividendCalculator.calculateDividendData(
+          position.accountId,
+          position.personName,
+          position.symbolId,
+          position.symbol,
+          position.openQuantity,
+          position.averageEntryPrice,
+          symbolInfo
+        );
+
+        // Check if update is needed
+        const oldTotal = position.dividendData?.totalReceived || 0;
+        const newTotal = newDividendData.totalReceived || 0;
+        
+        if (Math.abs(newTotal - oldTotal) > 0.01) {
+          updates.push({
+            symbol: position.symbol,
+            accountId: position.accountId,
+            oldTotalReceived: oldTotal,
+            newTotalReceived: newTotal,
+            difference: newTotal - oldTotal
+          });
+
+          if (!dryRun) {
+            // Update position with new dividend data
+            await Position.findByIdAndUpdate(position._id, {
+              dividendData: newDividendData,
+              updatedAt: new Date()
+            });
+            updated++;
+          }
+        }
+
+        logger.debug(`Recalculated ${position.symbol}: old=$${oldTotal.toFixed(2)}, new=$${newTotal.toFixed(2)}`);
+
+      } catch (error) {
+        logger.error(`Error recalculating dividends for ${position.symbol}:`, error);
+        errors.push({
+          symbol: position.symbol,
+          error: error.message
+        });
+      }
+    }
+
+    const response = {
+      success: true,
+      message: dryRun ? 'Dry run completed' : 'Dividend recalculation completed',
+      data: {
+        positionsProcessed: positions.length,
+        positionsUpdated: dryRun ? updates.length : updated,
+        errors: errors.length,
+        dryRun,
+        updates: updates.slice(0, 20), // Limit response size
+        errorDetails: errors
+      }
+    };
+
+    if (updates.length > 0) {
+      response.data.totalDifferenceAmount = updates.reduce((sum, u) => sum + u.difference, 0);
+    }
+
+    logger.info(`Dividend recalculation completed: ${updated} positions updated, ${errors.length} errors`);
+
+    res.json(response);
+
+  } catch (error) {
+    logger.error('Error recalculating dividends:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to recalculate dividends',
       details: error.message
     });
   }
