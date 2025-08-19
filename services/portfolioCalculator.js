@@ -70,7 +70,7 @@ class PortfolioCalculatorService {
       // Handle different view modes
       if (viewMode === 'account' && accountId) {
         // Single account view
-        const totalValue = positions.reduce((sum, p) => sum + (p.marketValue || 0), 0);
+        const totalValue = positions.reduce((sum, p) => sum + (p.marketValue || p.currentMarketValue || 0), 0);
         const totalCost = positions.reduce((sum, p) => sum + (p.totalCost || 0), 0);
         const totalPnL = totalValue - totalCost;
         const totalPnLPercent = totalCost > 0 ? (totalPnL / totalCost) * 100 : 0;
@@ -79,26 +79,59 @@ class PortfolioCalculatorService {
         const accounts = await this.dbManager.getAccounts({ accountId });
         const account = accounts[0] || {};
 
-        // Get cash balances
+        // Get cash balances for the specific account
         const cashBalances = await this.dbManager.getCashBalances({ accountId });
-        const totalCash = cashBalances.reduce((sum, b) => sum + (b.cash || 0), 0);
+        
+        // Calculate total cash from all currencies for this account
+        let totalCash = 0;
+        let cashByCurrency = {};
+        
+        if (cashBalances && cashBalances.length > 0) {
+          cashBalances.forEach(balance => {
+            const currency = balance.currency || 'CAD';
+            const cashAmount = balance.cash || 0;
+            
+            if (!cashByCurrency[currency]) {
+              cashByCurrency[currency] = 0;
+            }
+            cashByCurrency[currency] += cashAmount;
+            totalCash += cashAmount;
+          });
+        }
+
+        // Get dividend information
+        const dividendPositions = positions.filter(p => 
+          p.isDividendStock || (p.dividendData && p.dividendData.annualDividend > 0)
+        );
+        
+        const totalDividendsReceived = positions.reduce((sum, p) => 
+          sum + (p.dividendData?.totalReceived || 0), 0
+        );
+        
+        const annualDividendProjected = positions.reduce((sum, p) => 
+          sum + (p.dividendData?.annualDividend || 0), 0
+        );
 
         return {
           viewMode,
           accountId,
-          accountName: account.name,
+          accountName: account.displayName || account.name || account.accountId,
           accountType: account.type,
-          personName: account.personName,
+          personName: account.personName || personName,
           totalValue,
           totalCost,
           totalPnL,
           totalPnLPercent,
           totalCash,
+          cashByCurrency,
           totalAccountValue: totalValue + totalCash,
           positionCount: positions.length,
           positions,
           dayPnL: positions.reduce((sum, p) => sum + (p.dayPnL || 0), 0),
           dayPnLPercent: 0, // Would need previous day's value
+          dividendStocks: dividendPositions.length,
+          totalDividendsReceived,
+          annualDividendProjected,
           lastUpdated: new Date().toISOString()
         };
       } else if (viewMode === 'person' && personName) {
@@ -124,18 +157,36 @@ class PortfolioCalculatorService {
         // Get person's accounts
         const accounts = await this.dbManager.getAccounts({ personName });
         
-        // Get cash balances
+        // Get cash balances for the person
         const cashBalances = await this.dbManager.getCashBalances({ personName });
-        const totalCash = cashBalances.reduce((sum, b) => sum + (b.cash || 0), 0);
+        let totalCash = 0;
+        let cashByCurrency = {};
+        
+        if (cashBalances && cashBalances.length > 0) {
+          cashBalances.forEach(balance => {
+            const currency = balance.currency || 'CAD';
+            const cashAmount = balance.cash || 0;
+            
+            if (!cashByCurrency[currency]) {
+              cashByCurrency[currency] = 0;
+            }
+            cashByCurrency[currency] += cashAmount;
+            totalCash += cashAmount;
+          });
+        }
 
-        // Group cash by currency
-        const cashByCurrency = {};
-        cashBalances.forEach(balance => {
-          if (!cashByCurrency[balance.currency]) {
-            cashByCurrency[balance.currency] = 0;
-          }
-          cashByCurrency[balance.currency] += balance.cash || 0;
-        });
+        // Get dividend information
+        const dividendPositions = positions.filter(p => 
+          p.isDividendStock || (p.dividendData && p.dividendData.annualDividend > 0)
+        );
+        
+        const totalDividendsReceived = positions.reduce((sum, p) => 
+          sum + ((p.dividendData?.totalReceived || 0) + (p.totalReceived || 0)), 0
+        );
+        
+        const annualDividendProjected = positions.reduce((sum, p) => 
+          sum + ((p.dividendData?.annualDividend || 0) + (p.annualDividend || 0)), 0
+        );
 
         return {
           viewMode,
@@ -151,7 +202,7 @@ class PortfolioCalculatorService {
           accountCount: accounts.length,
           accounts: accounts.map(a => ({
             accountId: a.accountId,
-            accountName: a.name,
+            accountName: a.displayName || a.name || a.accountId,
             accountType: a.type
           })),
           positionCount: positions.length,
@@ -159,6 +210,9 @@ class PortfolioCalculatorService {
           positions,
           dayPnL: positions.reduce((sum, p) => sum + (p.dayPnL || 0), 0),
           dayPnLPercent: 0,
+          dividendStocks: dividendPositions.length,
+          totalDividendsReceived,
+          annualDividendProjected,
           lastUpdated: new Date().toISOString()
         };
       } else if (viewMode === 'type') {
@@ -195,16 +249,21 @@ class PortfolioCalculatorService {
         
         // Get all cash balances
         const cashBalances = await this.dbManager.getCashBalances();
-        const totalCash = cashBalances.reduce((sum, b) => sum + (b.cash || 0), 0);
-
-        // Group cash by currency
-        const cashByCurrency = {};
-        cashBalances.forEach(balance => {
-          if (!cashByCurrency[balance.currency]) {
-            cashByCurrency[balance.currency] = 0;
-          }
-          cashByCurrency[balance.currency] += balance.cash || 0;
-        });
+        let totalCash = 0;
+        let cashByCurrency = {};
+        
+        if (cashBalances && cashBalances.length > 0) {
+          cashBalances.forEach(balance => {
+            const currency = balance.currency || 'CAD';
+            const cashAmount = balance.cash || 0;
+            
+            if (!cashByCurrency[currency]) {
+              cashByCurrency[currency] = 0;
+            }
+            cashByCurrency[currency] += cashAmount;
+            totalCash += cashAmount;
+          });
+        }
 
         // Get unique persons
         const uniquePersons = new Set(accounts.map(a => a.personName).filter(p => p));
@@ -213,6 +272,19 @@ class PortfolioCalculatorService {
         const sortedByPnL = [...positions].sort((a, b) => b.unrealizedPnLPercent - a.unrealizedPnLPercent);
         const topGainers = sortedByPnL.slice(0, 5);
         const topLosers = sortedByPnL.slice(-5).reverse();
+
+        // Get dividend information
+        const dividendPositions = positions.filter(p => 
+          p.isDividendStock || (p.dividendData && p.dividendData.annualDividend > 0)
+        );
+        
+        const totalDividendsReceived = positions.reduce((sum, p) => 
+          sum + ((p.dividendData?.totalReceived || 0) + (p.totalReceived || 0)), 0
+        );
+        
+        const annualDividendProjected = positions.reduce((sum, p) => 
+          sum + ((p.dividendData?.annualDividend || 0) + (p.annualDividend || 0)), 0
+        );
 
         return {
           viewMode,
@@ -234,6 +306,9 @@ class PortfolioCalculatorService {
           topLosers,
           dayPnL: positions.reduce((sum, p) => sum + (p.dayPnL || 0), 0),
           dayPnLPercent: 0,
+          dividendStocks: dividendPositions.length,
+          totalDividendsReceived,
+          annualDividendProjected,
           lastUpdated: new Date().toISOString()
         };
       }
@@ -248,17 +323,23 @@ class PortfolioCalculatorService {
    */
   async filterDividendStocks(positions) {
     try {
-      // Get dividend info for all symbols
-      const symbols = [...new Set(positions.map(p => p.symbol))];
-      const dividendInfo = await this.dbManager.getDividendInfo(symbols);
-      
-      const dividendSymbols = new Set(
-        dividendInfo
-          .filter(d => d.dividendYield > 0 || d.isDividendStock)
-          .map(d => d.symbol)
-      );
-
-      return positions.filter(p => dividendSymbols.has(p.symbol) || p.isDividendStock);
+      // Filter positions that have dividend data
+      return positions.filter(p => {
+        // Check if position is marked as dividend stock
+        if (p.isDividendStock) return true;
+        
+        // Check if position has dividend data with actual dividends
+        if (p.dividendData) {
+          if (p.dividendData.totalReceived > 0) return true;
+          if (p.dividendData.annualDividend > 0) return true;
+          if (p.dividendData.annualDividendPerShare > 0) return true;
+        }
+        
+        // Check if position has dividendPerShare
+        if (p.dividendPerShare > 0) return true;
+        
+        return false;
+      });
     } catch (error) {
       logger.error('Error filtering dividend stocks:', error);
       return positions; // Return all positions if error

@@ -30,11 +30,19 @@ router.get('/summary', async (req, res, next) => {
 
     logger.info('Getting portfolio summary', { viewMode, accountId, personName, aggregate, dividendStocksOnly });
 
-    // Validate required parameters
+    // Validate required parameters based on viewMode
     if (viewMode === 'person' && !personName) {
       return res.status(400).json({
         success: false,
         error: 'personName is required when viewMode is "person"'
+      });
+    }
+
+    if (viewMode === 'account' && !accountId) {
+      // If no accountId provided with account viewMode, return error
+      return res.status(400).json({
+        success: false,
+        error: 'accountId is required when viewMode is "account"'
       });
     }
 
@@ -43,8 +51,8 @@ router.get('/summary', async (req, res, next) => {
       accountId,
       personName,
       aggregate: aggregate === 'true',
-      dividendStocksOnly: dividendStocksOnly === 'true',
-      includeClosedPositions: includeClosedPositions === 'true'
+      dividendStocksOnly: dividendStocksOnly === 'true' || dividendStocksOnly === true,
+      includeClosedPositions: includeClosedPositions === 'true' || includeClosedPositions === true
     });
 
     res.json({
@@ -75,11 +83,18 @@ router.get('/positions', async (req, res, next) => {
       sortOrder = 'desc' 
     } = req.query;
 
-    // Validate required parameters
+    // Validate required parameters based on viewMode
     if (viewMode === 'person' && !personName) {
       return res.status(400).json({
         success: false,
         error: 'personName is required when viewMode is "person"'
+      });
+    }
+
+    if (viewMode === 'account' && !accountId) {
+      return res.status(400).json({
+        success: false,
+        error: 'accountId is required when viewMode is "account"'
       });
     }
 
@@ -89,7 +104,7 @@ router.get('/positions', async (req, res, next) => {
       personName,
       symbol,
       aggregate: aggregate === 'true',
-      includeClosedPositions: includeClosedPositions === 'true',
+      includeClosedPositions: includeClosedPositions === 'true' || includeClosedPositions === true,
       sortBy,
       sortOrder
     });
@@ -159,6 +174,7 @@ router.get('/positions/:symbol', async (req, res, next) => {
         isDividendStock: position.isDividendStock || false,
         dividendYield: position.dividendYield || 0,
         annualDividend: position.annualDividend || 0,
+        dividendData: position.dividendData,
         lastUpdated: position.lastUpdated
       };
 
@@ -208,7 +224,8 @@ router.get('/positions/:symbol', async (req, res, next) => {
         unrealizedPnL: (position.currentMarketValue || 0) - (position.totalCost || 0),
         unrealizedPnLPercent: position.totalCost > 0 
           ? ((position.currentMarketValue - position.totalCost) / position.totalCost) * 100 
-          : 0
+          : 0,
+        dividendData: position.dividendData
       });
 
       // Update price if more recent

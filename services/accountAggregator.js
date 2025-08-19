@@ -15,7 +15,7 @@ class AccountAggregator {
    */
   aggregatePositions(positions, viewMode = 'all', options = {}) {
     try {
-      // Validate view mode - now includes 'account' and 'person'
+      // FIXED: Include 'account' and 'person' in valid view modes
       const validViewModes = ['all', 'account', 'person', 'type'];
       if (!validViewModes.includes(viewMode)) {
         throw new Error(`Invalid view mode: ${viewMode}. Must be one of: ${validViewModes.join(', ')}`);
@@ -685,6 +685,39 @@ class AccountAggregator {
       totalMarketValue: person.totalMarketValue,
       totalEquity: person.totalEquity
     }));
+  }
+
+  /**
+   * Get account dropdown options for UI
+   */
+  async getAccountDropdownOptions() {
+    try {
+      const accounts = await this.dbManager.getAccounts();
+      const persons = [...new Set(accounts.map(a => a.personName).filter(p => p))];
+      
+      const options = {
+        viewModes: [
+          { value: 'all', label: 'All Accounts' },
+          { value: 'account', label: 'By Account' },
+          { value: 'person', label: 'By Person' },
+          { value: 'type', label: 'By Type' }
+        ],
+        accounts: accounts.map(a => ({
+          value: a.accountId,
+          label: `${a.accountName || a.accountId} (${a.accountType})`,
+          personName: a.personName
+        })),
+        persons: persons.map(p => ({
+          value: p,
+          label: p
+        }))
+      };
+      
+      return options;
+    } catch (error) {
+      logger.error('Error getting account dropdown options:', error);
+      throw error;
+    }
   }
 }
 
