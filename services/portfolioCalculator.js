@@ -1,59 +1,59 @@
 // services/portfolioCalculator.js
-const Position = require('../models/Position');
-const Account = require('../models/Account');
-const Activity = require('../models/Activity');
-const Person = require('../models/Person');
-const accountAggregator = require('./accountAggregator');
-const logger = require('./logger');
+const logger = require('../utils/logger');
+const AccountAggregator = require('./accountAggregator');
 
 class PortfolioCalculatorService {
-  
+  constructor(dbManager, queueManager) {
+    this.dbManager = dbManager;
+    this.queueManager = queueManager;
+    this.accountAggregator = new AccountAggregator(dbManager);
+  }
+
   /**
-   * Get portfolio summary with person/account filtering
+   * Get comprehensive portfolio summary
    */
   async getPortfolioSummary(options = {}) {
-    const { viewMode = 'all', personName, accountId, aggregate = true } = options;
-    
     try {
-      let positions;
-      let accounts;
+      const {
+        viewMode = 'all',
+        accountId,
+        personName,
+        aggregate = true,
+        dividendStocksOnly = false,
+        includeClosedPositions = false
+      } = options;
 
-      // Get positions and accounts based on view mode
-      switch (viewMode) {
-        case 'person':
-          if (!personName) throw new Error('Person name required for person view mode');
-          positions = await Position.find({ personName });
-          accounts = await Account.find({ personName });
-          break;
-          
-        case 'account':
-          if (!accountId) throw new Error('Account ID required for account view mode');
-          positions = await Position.find({ accountId });
-          accounts = await Account.find({ accountId });
-          break;
-          
-        case 'all':
-        default:
-          positions = await Position.find({});
-          accounts = await Account.find({});
-          break;
+      logger.info('Calculating portfolio summary', { viewMode, accountId, personName, aggregate, dividendStocksOnly });
+
+      // Build filter
+      const filter = {};
+      if (accountId) filter.accountId = accountId;
+      if (personName) filter.personName = personName;
+      filter.includeClosedPositions = includeClosedPositions;
+
+      // Get positions from database
+      let positions = await this.dbManager.getPositions(filter);
+
+      // Filter for dividend stocks if requested
+      if (dividendStocksOnly) {
+        positions = await this.filterDividendStocks(positions);
       }
 
-      // Aggregate positions if requested and there are multiple accounts
-      if (aggregate && viewMode !== 'account') {
-        positions = await accountAggregator.aggregatePositions(positions, { groupBy: 'symbol' });
-      }
+      // Aggregate positions based on view mode
+      const aggregatedPositions = this.accountAggregator.aggregatePositions(
+        positions, 
+        viewMode, 
+        { accountId, personName, aggregate }
+      );
 
-      const summary = this.calculateSummaryMetrics(positions, accounts);
-      
-      // Add view mode context to response
-      summary.viewMode = viewMode;
-      summary.personName = personName;
-      summary.accountId = accountId;
-      summary.isAggregated = aggregate && viewMode !== 'account';
+      // Calculate portfolio-level metrics
+      const summary = await this.calculateSummaryMetrics(
+        aggregatedPositions, 
+        viewMode, 
+        { accountId, personName, aggregate }
+      );
 
       return summary;
-
     } catch (error) {
       logger.error('Error calculating portfolio summary:', error);
       throw error;
@@ -61,294 +61,313 @@ class PortfolioCalculatorService {
   }
 
   /**
-   * Calculate summary metrics from positions and accounts
+   * Calculate portfolio summary metrics
    */
-  calculateSummaryMetrics(positions, accounts) {
-    const summary = {
-      totalValue: 0,
-      totalCost: 0,
-      totalPnL: 0,
-      totalDividends: 0,
-      positionCount: positions.length,
-      accountCount: accounts.length,
-      topHoldings: [],
-      sectorBreakdown: {},
-      performanceMetrics: {}
-    };
-
-    // Calculate totals
-    positions.forEach(position => {
-      summary.totalValue += position.currentMarketValue || 0;
-      summary.totalCost += position.totalCost || 0;
-      summary.totalPnL += position.openPnl || 0;
-    });
-
-    // Calculate percentage returns
-    summary.totalReturnPercent = summary.totalCost > 0 ? 
-      (summary.totalPnL / summary.totalCost) * 100 : 0;
-
-    // Get top 5 holdings by value
-    summary.topHoldings = positions
-      .sort((a, b) => (b.currentMarketValue || 0) - (a.currentMarketValue || 0))
-      .slice(0, 5)
-      .map(position => ({
-        symbol: position.symbol,
-        value: position.currentMarketValue,
-        percentage: summary.totalValue > 0 ? 
-          (position.currentMarketValue / summary.totalValue) * 100 : 0,
-        pnl: position.openPnl,
-        pnlPercent: position.totalCost > 0 ? 
-          (position.openPnl / position.totalCost) * 100 : 0
-      }));
-
-    return summary;
-  }
-
-  /**
-   * Get detailed positions with filtering and aggregation
-   */
-  async getDetailedPositions(options = {}) {
-    const { viewMode = 'all', personName, accountId, aggregate = true, includeMetadata = false } = options;
-    
+  async calculateSummaryMetrics(positions, viewMode, options = {}) {
     try {
-      let query = {};
-      
-      // Build query based on view mode
-      switch (viewMode) {
-        case 'person':
-          if (!personName) throw new Error('Person name required for person view mode');
-          query.personName = personName;
-          break;
-          
-        case 'account':
-          if (!accountId) throw new Error('Account ID required for account view mode');
-          query.accountId = accountId;
-          break;
-          
-        case 'all':
-        default:
-          // No additional filters
-          break;
-      }
+      const { accountId, personName, aggregate } = options;
 
-      let positions = await Position.find(query).lean();
+      // Handle different view modes
+      if (viewMode === 'account' && accountId) {
+        // Single account view
+        const totalValue = positions.reduce((sum, p) => sum + (p.marketValue || 0), 0);
+        const totalCost = positions.reduce((sum, p) => sum + (p.totalCost || 0), 0);
+        const totalPnL = totalValue - totalCost;
+        const totalPnLPercent = totalCost > 0 ? (totalPnL / totalCost) * 100 : 0;
 
-      // Aggregate positions if requested
-      if (aggregate && viewMode !== 'account') {
-        positions = await accountAggregator.aggregatePositions(positions, {
-          groupBy: 'symbol',
-          includeAccountDetails: true
-        });
-      }
+        // Get account info
+        const accounts = await this.dbManager.getAccounts({ accountId });
+        const account = accounts[0] || {};
 
-      // Add metadata if requested
-      if (includeMetadata) {
-        positions = await this.enrichPositionsWithMetadata(positions);
-      }
+        // Get cash balances
+        const cashBalances = await this.dbManager.getCashBalances({ accountId });
+        const totalCash = cashBalances.reduce((sum, b) => sum + (b.cash || 0), 0);
 
-      // Sort by market value descending
-      positions.sort((a, b) => (b.currentMarketValue || 0) - (a.currentMarketValue || 0));
-
-      return positions;
-
-    } catch (error) {
-      logger.error('Error getting detailed positions:', error);
-      throw error;
-    }
-  }
-
-  /**
-   * Enrich positions with additional metadata
-   */
-  async enrichPositionsWithMetadata(positions) {
-    const enrichedPositions = [];
-
-    for (const position of positions) {
-      const enriched = { ...position };
-
-      // Calculate additional metrics
-      enriched.percentOfPortfolio = 0; // Will be calculated at portfolio level
-      enriched.dayChange = 0; // Would need market data
-      enriched.dayChangePercent = 0;
-      
-      // Calculate return percentages
-      if (position.totalCost && position.totalCost > 0) {
-        enriched.returnPercent = (position.openPnl / position.totalCost) * 100;
-      } else {
-        enriched.returnPercent = 0;
-      }
-
-      // Add position metrics
-      enriched.averageCost = position.openQuantity > 0 ? 
-        position.averageEntryPrice : 0;
-      
-      enriched.unrealizedGainLoss = position.openPnl || 0;
-      enriched.marketValue = position.currentMarketValue || 0;
-
-      enrichedPositions.push(enriched);
-    }
-
-    return enrichedPositions;
-  }
-
-  /**
-   * Get performance metrics for a person or account
-   */
-  async getPerformanceMetrics(options = {}) {
-    const { viewMode = 'all', personName, accountId, timeframe = '1Y' } = options;
-    
-    try {
-      let query = {};
-      
-      switch (viewMode) {
-        case 'person':
-          if (!personName) throw new Error('Person name required');
-          query.personName = personName;
-          break;
-        case 'account':
-          if (!accountId) throw new Error('Account ID required');
-          query.accountId = accountId;
-          break;
-      }
-
-      const positions = await Position.find(query);
-      const activities = await Activity.find(query);
-
-      const metrics = {
-        totalReturn: 0,
-        totalReturnPercent: 0,
-        realizedGains: 0,
-        unrealizedGains: 0,
-        totalDividends: 0,
-        totalCommissions: 0,
-        winRate: 0,
-        avgWin: 0,
-        avgLoss: 0,
-        sharpeRatio: 0,
-        maxDrawdown: 0,
-        timeframe
-      };
-
-      // Calculate from positions
-      positions.forEach(position => {
-        metrics.unrealizedGains += position.openPnl || 0;
-        metrics.totalReturn += position.openPnl || 0;
-      });
-
-      // Calculate from activities
-      let totalInvested = 0;
-      let totalDividends = 0;
-      let totalCommissions = 0;
-      let wins = 0;
-      let losses = 0;
-      let winAmount = 0;
-      let lossAmount = 0;
-
-      activities.forEach(activity => {
-        if (activity.type === 'Trades') {
-          totalCommissions += Math.abs(activity.commission || 0);
-          
-          if (activity.action === 'Buy') {
-            totalInvested += Math.abs(activity.netAmount || 0);
-          } else if (activity.action === 'Sell') {
-            const profit = activity.netAmount - activity.grossAmount;
-            if (profit > 0) {
-              wins++;
-              winAmount += profit;
-            } else if (profit < 0) {
-              losses++;
-              lossAmount += Math.abs(profit);
-            }
-          }
-        } else if (activity.type === 'Dividends') {
-          totalDividends += activity.netAmount || 0;
-        }
-      });
-
-      metrics.totalDividends = totalDividends;
-      metrics.totalCommissions = totalCommissions;
-      metrics.realizedGains = winAmount - lossAmount;
-      
-      if (totalInvested > 0) {
-        metrics.totalReturnPercent = (metrics.totalReturn / totalInvested) * 100;
-      }
-
-      if (wins + losses > 0) {
-        metrics.winRate = (wins / (wins + losses)) * 100;
-      }
-      
-      if (wins > 0) {
-        metrics.avgWin = winAmount / wins;
-      }
-      
-      if (losses > 0) {
-        metrics.avgLoss = lossAmount / losses;
-      }
-
-      return metrics;
-
-    } catch (error) {
-      logger.error('Error calculating performance metrics:', error);
-      throw error;
-    }
-  }
-
-  /**
-   * Get dividend calendar with person/account filtering
-   */
-  async getDividendCalendar(options = {}) {
-    const { viewMode = 'all', personName, accountId, startDate, endDate } = options;
-    
-    try {
-      let query = { type: 'Dividends' };
-      
-      switch (viewMode) {
-        case 'person':
-          if (!personName) throw new Error('Person name required');
-          query.personName = personName;
-          break;
-        case 'account':
-          if (!accountId) throw new Error('Account ID required');
-          query.accountId = accountId;
-          break;
-      }
-
-      if (startDate || endDate) {
-        query.transactionDate = {};
-        if (startDate) query.transactionDate.$gte = new Date(startDate);
-        if (endDate) query.transactionDate.$lte = new Date(endDate);
-      }
-
-      const dividends = await Activity.find(query)
-        .sort({ transactionDate: -1 })
-        .lean();
-
-      // Group by month for calendar view
-      const calendar = {};
-      
-      dividends.forEach(dividend => {
-        const monthKey = dividend.transactionDate.toISOString().substring(0, 7); // YYYY-MM
-        
-        if (!calendar[monthKey]) {
-          calendar[monthKey] = {
-            month: monthKey,
-            totalAmount: 0,
-            dividends: []
+        return {
+          viewMode,
+          accountId,
+          accountName: account.name,
+          accountType: account.type,
+          personName: account.personName,
+          totalValue,
+          totalCost,
+          totalPnL,
+          totalPnLPercent,
+          totalCash,
+          totalAccountValue: totalValue + totalCash,
+          positionCount: positions.length,
+          positions,
+          dayPnL: positions.reduce((sum, p) => sum + (p.dayPnL || 0), 0),
+          dayPnLPercent: 0, // Would need previous day's value
+          lastUpdated: new Date().toISOString()
+        };
+      } else if (viewMode === 'person' && personName) {
+        // Person view
+        if (!aggregate) {
+          // Individual positions for person
+          return {
+            viewMode,
+            personName,
+            aggregate: false,
+            positions,
+            positionCount: positions.length,
+            lastUpdated: new Date().toISOString()
           };
         }
+
+        // Aggregated view for person
+        const totalValue = positions.reduce((sum, p) => sum + (p.totalMarketValue || 0), 0);
+        const totalCost = positions.reduce((sum, p) => sum + (p.totalCost || 0), 0);
+        const totalPnL = totalValue - totalCost;
+        const totalPnLPercent = totalCost > 0 ? (totalPnL / totalCost) * 100 : 0;
+
+        // Get person's accounts
+        const accounts = await this.dbManager.getAccounts({ personName });
         
-        calendar[monthKey].totalAmount += dividend.netAmount || 0;
-        calendar[monthKey].dividends.push({
-          symbol: dividend.symbol,
-          date: dividend.transactionDate,
-          amount: dividend.netAmount,
-          quantity: dividend.quantity,
-          description: dividend.description
+        // Get cash balances
+        const cashBalances = await this.dbManager.getCashBalances({ personName });
+        const totalCash = cashBalances.reduce((sum, b) => sum + (b.cash || 0), 0);
+
+        // Group cash by currency
+        const cashByCurrency = {};
+        cashBalances.forEach(balance => {
+          if (!cashByCurrency[balance.currency]) {
+            cashByCurrency[balance.currency] = 0;
+          }
+          cashByCurrency[balance.currency] += balance.cash || 0;
         });
+
+        return {
+          viewMode,
+          personName,
+          aggregate: true,
+          totalValue,
+          totalCost,
+          totalPnL,
+          totalPnLPercent,
+          totalCash,
+          cashByCurrency,
+          totalAccountValue: totalValue + totalCash,
+          accountCount: accounts.length,
+          accounts: accounts.map(a => ({
+            accountId: a.accountId,
+            accountName: a.name,
+            accountType: a.type
+          })),
+          positionCount: positions.length,
+          uniqueSymbols: positions.length,
+          positions,
+          dayPnL: positions.reduce((sum, p) => sum + (p.dayPnL || 0), 0),
+          dayPnLPercent: 0,
+          lastUpdated: new Date().toISOString()
+        };
+      } else if (viewMode === 'type') {
+        // Grouped by type view
+        return {
+          viewMode,
+          types: positions,
+          totalTypes: positions.length,
+          grandTotalValue: positions.reduce((sum, t) => sum + (t.totalValue || 0), 0),
+          grandTotalCost: positions.reduce((sum, t) => sum + (t.totalCost || 0), 0),
+          grandTotalPnL: positions.reduce((sum, t) => sum + (t.totalPnL || 0), 0),
+          lastUpdated: new Date().toISOString()
+        };
+      } else {
+        // Default 'all' view - aggregated across everything
+        if (!aggregate) {
+          // Return individual positions
+          return {
+            viewMode,
+            aggregate: false,
+            positions,
+            positionCount: positions.length,
+            lastUpdated: new Date().toISOString()
+          };
+        }
+
+        const totalValue = positions.reduce((sum, p) => sum + (p.totalMarketValue || 0), 0);
+        const totalCost = positions.reduce((sum, p) => sum + (p.totalCost || 0), 0);
+        const totalPnL = totalValue - totalCost;
+        const totalPnLPercent = totalCost > 0 ? (totalPnL / totalCost) * 100 : 0;
+
+        // Get all accounts
+        const accounts = await this.dbManager.getAccounts();
+        
+        // Get all cash balances
+        const cashBalances = await this.dbManager.getCashBalances();
+        const totalCash = cashBalances.reduce((sum, b) => sum + (b.cash || 0), 0);
+
+        // Group cash by currency
+        const cashByCurrency = {};
+        cashBalances.forEach(balance => {
+          if (!cashByCurrency[balance.currency]) {
+            cashByCurrency[balance.currency] = 0;
+          }
+          cashByCurrency[balance.currency] += balance.cash || 0;
+        });
+
+        // Get unique persons
+        const uniquePersons = new Set(accounts.map(a => a.personName).filter(p => p));
+
+        // Get top gainers and losers
+        const sortedByPnL = [...positions].sort((a, b) => b.unrealizedPnLPercent - a.unrealizedPnLPercent);
+        const topGainers = sortedByPnL.slice(0, 5);
+        const topLosers = sortedByPnL.slice(-5).reverse();
+
+        return {
+          viewMode,
+          aggregate: true,
+          totalValue,
+          totalCost,
+          totalPnL,
+          totalPnLPercent,
+          totalCash,
+          cashByCurrency,
+          totalAccountValue: totalValue + totalCash,
+          positionCount: positions.length,
+          uniqueSymbols: positions.length,
+          totalAccounts: accounts.length,
+          totalPersons: uniquePersons.size,
+          persons: Array.from(uniquePersons),
+          positions,
+          topGainers,
+          topLosers,
+          dayPnL: positions.reduce((sum, p) => sum + (p.dayPnL || 0), 0),
+          dayPnLPercent: 0,
+          lastUpdated: new Date().toISOString()
+        };
+      }
+    } catch (error) {
+      logger.error('Error calculating summary metrics:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Filter positions to only include dividend-paying stocks
+   */
+  async filterDividendStocks(positions) {
+    try {
+      // Get dividend info for all symbols
+      const symbols = [...new Set(positions.map(p => p.symbol))];
+      const dividendInfo = await this.dbManager.getDividendInfo(symbols);
+      
+      const dividendSymbols = new Set(
+        dividendInfo
+          .filter(d => d.dividendYield > 0 || d.isDividendStock)
+          .map(d => d.symbol)
+      );
+
+      return positions.filter(p => dividendSymbols.has(p.symbol) || p.isDividendStock);
+    } catch (error) {
+      logger.error('Error filtering dividend stocks:', error);
+      return positions; // Return all positions if error
+    }
+  }
+
+  /**
+   * Get positions with optional filters
+   */
+  async getPositions(options = {}) {
+    try {
+      const {
+        viewMode = 'all',
+        accountId,
+        personName,
+        symbol,
+        aggregate = true,
+        includeClosedPositions = false,
+        sortBy = 'marketValue',
+        sortOrder = 'desc'
+      } = options;
+
+      // Build filter
+      const filter = {};
+      if (accountId) filter.accountId = accountId;
+      if (personName) filter.personName = personName;
+      if (symbol) filter.symbol = symbol;
+      filter.includeClosedPositions = includeClosedPositions;
+
+      let positions = await this.dbManager.getPositions(filter);
+
+      // Aggregate based on view mode
+      positions = this.accountAggregator.aggregatePositions(
+        positions,
+        viewMode,
+        { accountId, personName, aggregate }
+      );
+
+      // Sort positions
+      positions.sort((a, b) => {
+        let aVal = a[sortBy] || 0;
+        let bVal = b[sortBy] || 0;
+        
+        if (typeof aVal === 'string') {
+          return sortOrder === 'desc' 
+            ? bVal.localeCompare(aVal)
+            : aVal.localeCompare(bVal);
+        }
+        
+        return sortOrder === 'desc' ? bVal - aVal : aVal - bVal;
       });
 
-      return Object.values(calendar);
+      return positions;
+    } catch (error) {
+      logger.error('Error getting positions:', error);
+      throw error;
+    }
+  }
 
+  /**
+   * Get dividend calendar
+   */
+  async getDividendCalendar(options = {}) {
+    try {
+      const {
+        viewMode = 'all',
+        accountId,
+        personName,
+        startDate,
+        endDate,
+        groupBy = 'month'
+      } = options;
+
+      // Build filter
+      const filter = {};
+      if (accountId) filter.accountId = accountId;
+      if (personName) filter.personName = personName;
+      if (startDate) filter.startDate = startDate;
+      if (endDate) filter.endDate = endDate;
+
+      // Get positions to know which symbols to check
+      const positions = await this.dbManager.getPositions(filter);
+      const symbols = [...new Set(positions.map(p => p.symbol))];
+
+      // Get dividend info
+      const dividendInfo = await this.dbManager.getDividendInfo(symbols);
+      
+      // Get historical dividends
+      const historicalDividends = await this.dbManager.getDividends(filter);
+
+      // Build calendar
+      const calendar = this.buildDividendCalendar(
+        positions,
+        dividendInfo,
+        historicalDividends,
+        { startDate, endDate, groupBy }
+      );
+
+      return {
+        viewMode,
+        accountId,
+        personName,
+        calendar,
+        summary: {
+          totalAnnualDividends: this.calculateAnnualDividends(positions, dividendInfo),
+          averageYield: this.calculateAverageYield(positions, dividendInfo),
+          dividendStockCount: dividendInfo.filter(d => d.isDividendStock).length
+        }
+      };
     } catch (error) {
       logger.error('Error getting dividend calendar:', error);
       throw error;
@@ -356,65 +375,703 @@ class PortfolioCalculatorService {
   }
 
   /**
-   * Get account allocation breakdown
+   * Get performance metrics
    */
-  async getAccountAllocation(personName) {
+  async getPerformanceMetrics(options = {}) {
     try {
-      const accounts = await Account.find({ personName });
-      const allocation = [];
+      const {
+        accountId,
+        personName,
+        period = '1M',
+        groupBy = 'day'
+      } = options;
 
-      for (const account of accounts) {
-        const positions = await Position.find({ accountId: account.accountId });
-        const totalValue = positions.reduce((sum, pos) => sum + (pos.currentMarketValue || 0), 0);
-        
-        allocation.push({
-          accountId: account.accountId,
-          accountType: account.type,
-          accountNumber: account.number,
-          totalValue,
-          positionCount: positions.length,
-          positions: positions.map(pos => ({
-            symbol: pos.symbol,
-            value: pos.currentMarketValue,
-            percentage: totalValue > 0 ? (pos.currentMarketValue / totalValue) * 100 : 0
-          }))
-        });
+      // Calculate date range based on period
+      const endDate = new Date();
+      const startDate = this.getStartDateForPeriod(period);
+
+      // Build filter
+      const filter = {
+        startDate: startDate.toISOString(),
+        endDate: endDate.toISOString()
+      };
+      if (accountId) filter.accountId = accountId;
+      if (personName) filter.personName = personName;
+
+      // Get snapshots for the period
+      const snapshots = await this.dbManager.getPortfolioSnapshots(filter);
+
+      if (snapshots.length === 0) {
+        return {
+          period,
+          startDate: startDate.toISOString(),
+          endDate: endDate.toISOString(),
+          metrics: [],
+          summary: {
+            totalReturn: 0,
+            totalReturnPercent: 0,
+            averageDailyReturn: 0,
+            volatility: 0,
+            sharpeRatio: 0
+          }
+        };
       }
 
-      return allocation;
+      // Group and calculate metrics
+      const metrics = this.groupPerformanceData(snapshots, groupBy);
+      const summary = this.calculatePerformanceSummary(snapshots);
 
+      return {
+        period,
+        startDate: startDate.toISOString(),
+        endDate: endDate.toISOString(),
+        metrics,
+        summary
+      };
     } catch (error) {
-      logger.error('Error getting account allocation:', error);
+      logger.error('Error getting performance metrics:', error);
       throw error;
     }
   }
 
   /**
-   * Get portfolio comparison between persons
+   * Get dividend summary
    */
-  async getPersonComparison(personNames) {
+  async getDividendSummary(options = {}) {
     try {
-      const comparison = [];
+      const {
+        accountId,
+        personName,
+        startDate,
+        endDate,
+        groupBy = 'month'
+      } = options;
 
-      for (const personName of personNames) {
-        const summary = await this.getPortfolioSummary({ 
-          viewMode: 'person', 
-          personName 
+      // Build filter
+      const filter = {};
+      if (accountId) filter.accountId = accountId;
+      if (personName) filter.personName = personName;
+      if (startDate) filter.startDate = startDate;
+      if (endDate) filter.endDate = endDate;
+
+      const dividends = await this.dbManager.getDividends(filter);
+
+      // Group dividends
+      const grouped = this.groupDividendData(dividends, groupBy);
+      
+      // Calculate summary
+      const totalDividends = dividends.reduce((sum, d) => sum + (d.amount || 0), 0);
+      const uniqueSymbols = new Set(dividends.map(d => d.symbol)).size;
+      const uniqueAccounts = new Set(dividends.map(d => d.accountId)).size;
+      const uniquePersons = new Set(dividends.map(d => d.personName).filter(p => p)).size;
+      
+      return {
+        totalDividends,
+        dividendCount: dividends.length,
+        uniqueSymbols,
+        uniqueAccounts,
+        uniquePersons,
+        averagePerDividend: dividends.length > 0 ? totalDividends / dividends.length : 0,
+        grouped,
+        dividends
+      };
+    } catch (error) {
+      logger.error('Error getting dividend summary:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Get portfolio allocation
+   */
+  async getAllocation(options = {}) {
+    try {
+      const {
+        accountId,
+        personName,
+        groupBy = 'sector'
+      } = options;
+
+      // Build filter
+      const filter = {};
+      if (accountId) filter.accountId = accountId;
+      if (personName) filter.personName = personName;
+
+      const positions = await this.dbManager.getPositions(filter);
+      
+      // Get additional data based on groupBy
+      let allocation = [];
+      
+      switch (groupBy) {
+        case 'sector':
+          allocation = await this.allocateBySector(positions);
+          break;
+        case 'type':
+          allocation = this.allocateByType(positions);
+          break;
+        case 'currency':
+          allocation = this.allocateByCurrency(positions);
+          break;
+        case 'account':
+          allocation = this.allocateByAccount(positions);
+          break;
+        case 'person':
+          allocation = this.allocateByPerson(positions);
+          break;
+        default:
+          allocation = this.allocateByType(positions);
+      }
+
+      // Calculate percentages
+      const totalValue = allocation.reduce((sum, a) => sum + a.value, 0);
+      allocation = allocation.map(a => ({
+        ...a,
+        percentage: totalValue > 0 ? (a.value / totalValue) * 100 : 0
+      }));
+
+      // Sort by value descending
+      allocation.sort((a, b) => b.value - a.value);
+
+      return {
+        groupBy,
+        totalValue,
+        allocation
+      };
+    } catch (error) {
+      logger.error('Error getting portfolio allocation:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Create portfolio snapshot
+   */
+  async createSnapshot(options = {}) {
+    try {
+      const { accountId, personName } = options;
+
+      // Build filter
+      const filter = {};
+      if (accountId) filter.accountId = accountId;
+      if (personName) filter.personName = personName;
+
+      const accounts = await this.dbManager.getAccounts(filter);
+      const snapshots = [];
+
+      for (const account of accounts) {
+        const positions = await this.dbManager.getPositions({ 
+          accountId: account.accountId 
         });
-        
-        comparison.push({
-          personName,
-          ...summary
+
+        const totalValue = positions.reduce((sum, p) => sum + (p.currentMarketValue || 0), 0);
+        const totalCost = positions.reduce((sum, p) => sum + (p.totalCost || 0), 0);
+        const totalPnL = totalValue - totalCost;
+        const totalPnLPercent = totalCost > 0 ? (totalPnL / totalCost) * 100 : 0;
+
+        // Get cash balances
+        const cashBalances = await this.dbManager.getCashBalances({ 
+          accountId: account.accountId 
+        });
+        const totalCash = cashBalances.reduce((sum, b) => sum + (b.cash || 0), 0);
+
+        const snapshot = {
+          accountId: account.accountId,
+          accountName: account.name,
+          accountType: account.type,
+          personName: account.personName,
+          snapshotDate: new Date().toISOString(),
+          totalValue,
+          totalCost,
+          totalPnL,
+          totalPnLPercent,
+          totalCash,
+          totalAccountValue: totalValue + totalCash,
+          positionCount: positions.length,
+          positions: positions.map(p => ({
+            symbol: p.symbol,
+            quantity: p.openQuantity,
+            marketValue: p.currentMarketValue,
+            cost: p.totalCost,
+            unrealizedPnL: p.currentMarketValue - p.totalCost
+          }))
+        };
+
+        await this.dbManager.savePortfolioSnapshot(snapshot);
+        snapshots.push(snapshot);
+      }
+
+      return snapshots;
+    } catch (error) {
+      logger.error('Error creating portfolio snapshot:', error);
+      throw error;
+    }
+  }
+
+  // Helper methods
+  getStartDateForPeriod(period) {
+    const date = new Date();
+    switch (period) {
+      case '1D': date.setDate(date.getDate() - 1); break;
+      case '1W': date.setDate(date.getDate() - 7); break;
+      case '1M': date.setMonth(date.getMonth() - 1); break;
+      case '3M': date.setMonth(date.getMonth() - 3); break;
+      case '6M': date.setMonth(date.getMonth() - 6); break;
+      case '1Y': date.setFullYear(date.getFullYear() - 1); break;
+      case 'YTD': 
+        date.setMonth(0); 
+        date.setDate(1); 
+        date.setHours(0, 0, 0, 0);
+        break;
+      case 'ALL': date.setFullYear(2000); break;
+      default: date.setMonth(date.getMonth() - 1);
+    }
+    return date;
+  }
+
+  groupPerformanceData(snapshots, groupBy) {
+    const grouped = new Map();
+    
+    snapshots.forEach(snapshot => {
+      let key;
+      const date = new Date(snapshot.snapshotDate);
+      
+      switch (groupBy) {
+        case 'day':
+          key = date.toISOString().split('T')[0];
+          break;
+        case 'week':
+          const weekStart = new Date(date);
+          weekStart.setDate(date.getDate() - date.getDay());
+          key = weekStart.toISOString().split('T')[0];
+          break;
+        case 'month':
+          key = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`;
+          break;
+        default:
+          key = date.toISOString().split('T')[0];
+      }
+      
+      if (!grouped.has(key)) {
+        grouped.set(key, {
+          date: key,
+          totalValue: 0,
+          totalCost: 0,
+          totalPnL: 0,
+          count: 0
+        });
+      }
+      
+      const group = grouped.get(key);
+      group.totalValue += snapshot.totalValue || 0;
+      group.totalCost += snapshot.totalCost || 0;
+      group.totalPnL += snapshot.totalPnL || 0;
+      group.count++;
+    });
+    
+    return Array.from(grouped.values()).map(g => ({
+      date: g.date,
+      value: g.totalValue / g.count,
+      pnl: g.totalPnL / g.count,
+      pnlPercent: g.totalCost > 0 ? (g.totalPnL / g.totalCost) * 100 : 0
+    })).sort((a, b) => new Date(a.date) - new Date(b.date));
+  }
+
+  calculatePerformanceSummary(snapshots) {
+    if (snapshots.length < 2) {
+      return {
+        totalReturn: 0,
+        totalReturnPercent: 0,
+        averageDailyReturn: 0,
+        volatility: 0,
+        sharpeRatio: 0
+      };
+    }
+
+    // Sort by date
+    const sorted = [...snapshots].sort((a, b) => 
+      new Date(a.snapshotDate) - new Date(b.snapshotDate)
+    );
+
+    const first = sorted[0];
+    const last = sorted[sorted.length - 1];
+    const totalReturn = last.totalValue - first.totalValue;
+    const totalReturnPercent = first.totalValue > 0 
+      ? (totalReturn / first.totalValue) * 100 
+      : 0;
+
+    // Calculate daily returns for volatility
+    const dailyReturns = [];
+    for (let i = 1; i < sorted.length; i++) {
+      const prevValue = sorted[i - 1].totalValue;
+      const currValue = sorted[i].totalValue;
+      if (prevValue > 0) {
+        dailyReturns.push((currValue - prevValue) / prevValue);
+      }
+    }
+
+    const averageDailyReturn = dailyReturns.length > 0
+      ? dailyReturns.reduce((a, b) => a + b, 0) / dailyReturns.length
+      : 0;
+
+    // Calculate volatility (standard deviation)
+    const variance = dailyReturns.length > 0
+      ? dailyReturns.reduce((sum, r) => sum + Math.pow(r - averageDailyReturn, 2), 0) / dailyReturns.length
+      : 0;
+    const volatility = Math.sqrt(variance) * Math.sqrt(252) * 100; // Annualized
+
+    // Calculate Sharpe ratio (assuming risk-free rate of 2%)
+    const riskFreeRate = 0.02;
+    const annualizedReturn = averageDailyReturn * 252;
+    const sharpeRatio = volatility > 0 
+      ? (annualizedReturn - riskFreeRate) / (volatility / 100)
+      : 0;
+
+    return {
+      totalReturn,
+      totalReturnPercent,
+      averageDailyReturn: averageDailyReturn * 100,
+      volatility,
+      sharpeRatio
+    };
+  }
+
+  groupDividendData(dividends, groupBy) {
+    const grouped = new Map();
+    
+    dividends.forEach(dividend => {
+      let key;
+      switch (groupBy) {
+        case 'month':
+          key = dividend.paymentDate ? dividend.paymentDate.substring(0, 7) : 'Unknown';
+          break;
+        case 'quarter':
+          if (dividend.paymentDate) {
+            const date = new Date(dividend.paymentDate);
+            key = `${date.getFullYear()}-Q${Math.floor(date.getMonth() / 3) + 1}`;
+          } else {
+            key = 'Unknown';
+          }
+          break;
+        case 'year':
+          key = dividend.paymentDate ? dividend.paymentDate.substring(0, 4) : 'Unknown';
+          break;
+        case 'symbol':
+          key = dividend.symbol;
+          break;
+        case 'account':
+          key = `${dividend.accountId}-${dividend.accountName || 'Unknown'}`;
+          break;
+        case 'person':
+          key = dividend.personName || 'Unknown';
+          break;
+        default:
+          key = dividend.paymentDate ? dividend.paymentDate.substring(0, 7) : 'Unknown';
+      }
+
+      if (!grouped.has(key)) {
+        grouped.set(key, {
+          period: key,
+          totalAmount: 0,
+          count: 0,
+          symbols: new Set(),
+          accounts: new Set(),
+          persons: new Set()
         });
       }
 
-      return comparison;
+      const group = grouped.get(key);
+      group.totalAmount += dividend.amount || 0;
+      group.count += 1;
+      group.symbols.add(dividend.symbol);
+      if (dividend.accountId) group.accounts.add(dividend.accountId);
+      if (dividend.personName) group.persons.add(dividend.personName);
+    });
 
+    return Array.from(grouped.values()).map(g => ({
+      ...g,
+      symbols: Array.from(g.symbols),
+      symbolCount: g.symbols.size,
+      accounts: Array.from(g.accounts),
+      accountCount: g.accounts.size,
+      persons: Array.from(g.persons),
+      personCount: g.persons.size
+    })).sort((a, b) => b.period.localeCompare(a.period));
+  }
+
+  buildDividendCalendar(positions, dividendInfo, historicalDividends, options) {
+    const { startDate, endDate, groupBy } = options;
+    const calendar = [];
+
+    // Build calendar entries from dividend info and positions
+    dividendInfo.forEach(info => {
+      if (!info.isDividendStock) return;
+
+      const relevantPositions = positions.filter(p => p.symbol === info.symbol);
+      if (relevantPositions.length === 0) return;
+
+      const totalShares = relevantPositions.reduce((sum, p) => sum + (p.openQuantity || 0), 0);
+      const estimatedAmount = totalShares * (info.dividendPerShare || 0);
+
+      calendar.push({
+        symbol: info.symbol,
+        exDividendDate: info.exDividendDate,
+        paymentDate: info.paymentDate,
+        dividendPerShare: info.dividendPerShare,
+        dividendYield: info.dividendYield,
+        frequency: info.dividendFrequency,
+        totalShares,
+        estimatedAmount,
+        accounts: relevantPositions.map(p => ({
+          accountId: p.accountId,
+          accountName: p.accountName,
+          personName: p.personName,
+          shares: p.openQuantity
+        }))
+      });
+    });
+
+    // Add historical dividends
+    historicalDividends.forEach(dividend => {
+      calendar.push({
+        symbol: dividend.symbol,
+        paymentDate: dividend.paymentDate,
+        dividendPerShare: dividend.dividendPerShare,
+        amount: dividend.amount,
+        accountId: dividend.accountId,
+        accountName: dividend.accountName,
+        personName: dividend.personName,
+        isHistorical: true
+      });
+    });
+
+    // Sort by payment date
+    calendar.sort((a, b) => {
+      const dateA = new Date(a.paymentDate || a.exDividendDate);
+      const dateB = new Date(b.paymentDate || b.exDividendDate);
+      return dateA - dateB;
+    });
+
+    return calendar;
+  }
+
+  calculateAnnualDividends(positions, dividendInfo) {
+    let totalAnnual = 0;
+
+    dividendInfo.forEach(info => {
+      if (!info.isDividendStock) return;
+
+      const relevantPositions = positions.filter(p => p.symbol === info.symbol);
+      const totalShares = relevantPositions.reduce((sum, p) => sum + (p.openQuantity || 0), 0);
+      
+      // Calculate based on frequency
+      let paymentsPerYear = 4; // Default quarterly
+      if (info.dividendFrequency === 'Monthly') paymentsPerYear = 12;
+      else if (info.dividendFrequency === 'Annual') paymentsPerYear = 1;
+      else if (info.dividendFrequency === 'Semi-Annual') paymentsPerYear = 2;
+
+      totalAnnual += totalShares * (info.dividendPerShare || 0) * paymentsPerYear;
+    });
+
+    return totalAnnual;
+  }
+
+  calculateAverageYield(positions, dividendInfo) {
+    let totalValue = 0;
+    let totalDividendValue = 0;
+
+    positions.forEach(position => {
+      const info = dividendInfo.find(d => d.symbol === position.symbol);
+      if (info && info.isDividendStock) {
+        const positionValue = position.currentMarketValue || 0;
+        totalValue += positionValue;
+        totalDividendValue += positionValue * (info.dividendYield || 0) / 100;
+      }
+    });
+
+    return totalValue > 0 ? (totalDividendValue / totalValue) * 100 : 0;
+  }
+
+  allocateByType(positions) {
+    const groups = new Map();
+    
+    positions.forEach(position => {
+      const type = position.securityType || 'Unknown';
+      if (!groups.has(type)) {
+        groups.set(type, {
+          name: type,
+          value: 0,
+          cost: 0,
+          positions: [],
+          symbols: new Set()
+        });
+      }
+      
+      const group = groups.get(type);
+      group.value += position.currentMarketValue || 0;
+      group.cost += position.totalCost || 0;
+      group.positions.push(position.symbol);
+      group.symbols.add(position.symbol);
+    });
+
+    return Array.from(groups.values()).map(g => ({
+      ...g,
+      symbolCount: g.symbols.size,
+      symbols: Array.from(g.symbols)
+    }));
+  }
+
+  allocateByCurrency(positions) {
+    const groups = new Map();
+    
+    positions.forEach(position => {
+      const currency = position.currency || 'USD';
+      if (!groups.has(currency)) {
+        groups.set(currency, {
+          name: currency,
+          value: 0,
+          cost: 0,
+          positions: [],
+          symbols: new Set()
+        });
+      }
+      
+      const group = groups.get(currency);
+      group.value += position.currentMarketValue || 0;
+      group.cost += position.totalCost || 0;
+      group.positions.push(position.symbol);
+      group.symbols.add(position.symbol);
+    });
+
+    return Array.from(groups.values()).map(g => ({
+      ...g,
+      symbolCount: g.symbols.size,
+      symbols: Array.from(g.symbols)
+    }));
+  }
+
+  allocateByAccount(positions) {
+    const groups = new Map();
+    
+    positions.forEach(position => {
+      const accountKey = `${position.accountId}-${position.accountName}`;
+      if (!groups.has(accountKey)) {
+        groups.set(accountKey, {
+          name: position.accountName || position.accountId,
+          accountId: position.accountId,
+          accountType: position.accountType,
+          personName: position.personName,
+          value: 0,
+          cost: 0,
+          positions: [],
+          symbols: new Set()
+        });
+      }
+      
+      const group = groups.get(accountKey);
+      group.value += position.currentMarketValue || 0;
+      group.cost += position.totalCost || 0;
+      group.positions.push(position.symbol);
+      group.symbols.add(position.symbol);
+    });
+
+    return Array.from(groups.values()).map(g => ({
+      ...g,
+      symbolCount: g.symbols.size,
+      symbols: Array.from(g.symbols)
+    }));
+  }
+
+  allocateByPerson(positions) {
+    const groups = new Map();
+    
+    positions.forEach(position => {
+      const person = position.personName || 'Unknown';
+      if (!groups.has(person)) {
+        groups.set(person, {
+          name: person,
+          value: 0,
+          cost: 0,
+          positions: [],
+          symbols: new Set(),
+          accounts: new Set()
+        });
+      }
+      
+      const group = groups.get(person);
+      group.value += position.currentMarketValue || 0;
+      group.cost += position.totalCost || 0;
+      group.positions.push(position.symbol);
+      group.symbols.add(position.symbol);
+      group.accounts.add(position.accountId);
+    });
+
+    return Array.from(groups.values()).map(g => ({
+      ...g,
+      symbolCount: g.symbols.size,
+      symbols: Array.from(g.symbols),
+      accountCount: g.accounts.size,
+      accounts: Array.from(g.accounts)
+    }));
+  }
+
+  async allocateBySector(positions) {
+    try {
+      // This would require fetching sector data for each symbol
+      // For now, using a mock implementation
+      const sectorMap = {
+        'Technology': ['AAPL', 'MSFT', 'GOOGL', 'META', 'NVDA'],
+        'Financial': ['JPM', 'BAC', 'WFC', 'GS', 'MS', 'TD.TO', 'RY.TO', 'BNS.TO'],
+        'Healthcare': ['JNJ', 'PFE', 'UNH', 'CVS', 'ABBV'],
+        'Consumer': ['AMZN', 'WMT', 'HD', 'NKE', 'MCD'],
+        'Energy': ['XOM', 'CVX', 'COP', 'SLB', 'EOG'],
+        'Industrial': ['BA', 'CAT', 'GE', 'MMM', 'HON'],
+        'Materials': ['GOLD', 'NEM', 'FCX', 'KILO.TO'],
+        'Utilities': ['NEE', 'DUK', 'SO', 'D', 'AEP'],
+        'Real Estate': ['AMT', 'PLD', 'CCI', 'EQIX', 'PSA'],
+        'ETF': ['SPY', 'QQQ', 'VTI', 'IWM', 'GLD', 'VFV.TO', 'HMAX.TO']
+      };
+
+      const groups = new Map();
+
+      positions.forEach(position => {
+        let sector = 'Other';
+        
+        // Find sector for symbol
+        for (const [sectorName, symbols] of Object.entries(sectorMap)) {
+          if (symbols.includes(position.symbol)) {
+            sector = sectorName;
+            break;
+          }
+        }
+
+        if (!groups.has(sector)) {
+          groups.set(sector, {
+            name: sector,
+            value: 0,
+            cost: 0,
+            positions: [],
+            symbols: new Set()
+          });
+        }
+
+        const group = groups.get(sector);
+        group.value += position.currentMarketValue || 0;
+        group.cost += position.totalCost || 0;
+        group.positions.push(position.symbol);
+        group.symbols.add(position.symbol);
+      });
+
+      return Array.from(groups.values()).map(g => ({
+        ...g,
+        symbolCount: g.symbols.size,
+        symbols: Array.from(g.symbols)
+      }));
     } catch (error) {
-      logger.error('Error getting person comparison:', error);
-      throw error;
+      logger.error('Error allocating by sector:', error);
+      // Fallback to type allocation
+      return this.allocateByType(positions);
     }
   }
 }
 
-module.exports = new PortfolioCalculatorService();
+module.exports = PortfolioCalculatorService;

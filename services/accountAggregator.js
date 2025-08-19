@@ -1,604 +1,691 @@
-// services/accountAggregator.js - Fixed to properly aggregate totalReceived from dividend data
-const Position = require('../models/Position');
-const Activity = require('../models/Activity');
-const Account = require('../models/Account');
-const Symbol = require('../models/Symbol');
+// services/accountAggregator.js
 const logger = require('../utils/logger');
-const Person = require('../models/Person');
 
 class AccountAggregator {
-  
-  // Aggregate positions across accounts
-  async aggregatePositions(viewMode, personName = null, accountId = null) {
+  constructor(dbManager) {
+    this.dbManager = dbManager;
+  }
+
+  /**
+   * Aggregate positions based on view mode
+   * @param {Array} positions - Raw positions from database
+   * @param {string} viewMode - 'all', 'account', 'person', or 'type'
+   * @param {Object} options - Additional options
+   * @returns {Array} Aggregated positions
+   */
+  aggregatePositions(positions, viewMode = 'all', options = {}) {
     try {
-      let query = {};
-      
-      // Build query based on view mode
+      // Validate view mode - now includes 'account' and 'person'
+      const validViewModes = ['all', 'account', 'person', 'type'];
+      if (!validViewModes.includes(viewMode)) {
+        throw new Error(`Invalid view mode: ${viewMode}. Must be one of: ${validViewModes.join(', ')}`);
+      }
+
+      logger.debug(`Aggregating ${positions.length} positions with view mode: ${viewMode}`, options);
+
       switch (viewMode) {
         case 'all':
-          // No additional filters - get all positions
-          break;
-        case 'person':
-          if (personName) {
-            query.personName = personName;
-          }
-          break;
+          return options.aggregate !== false 
+            ? this.aggregateAllAccounts(positions, options)
+            : this.individualPositions(positions, options);
         case 'account':
-          if (accountId) {
-            query.accountId = accountId;
-          }
-          break;
+          return this.aggregateByAccount(positions, options);
+        case 'person':
+          return options.aggregate !== false
+            ? this.aggregateByPerson(positions, options)
+            : this.individualPositionsByPerson(positions, options);
+        case 'type':
+          return this.aggregateByType(positions, options);
         default:
-          throw new Error('Invalid view mode');
+          throw new Error(`Invalid view mode: ${viewMode}`);
       }
-
-      const positions = await Position.find(query).lean();
-      
-      if (positions.length === 0) {
-        return [];
-      }
-
-      // If single account view, return positions as-is but enriched
-      if (viewMode === 'account') {
-        return await this.enrichPositions(positions);
-      }
-
-      // Build account map for quick lookup of account details
-      const accountIds = [...new Set(positions.map(p => p.accountId))];
-      const accounts = await Account.find({ accountId: { $in: accountIds } }).lean();
-      const accountMap = {};
-      accounts.forEach(acc => { accountMap[acc.accountId] = acc; });
-
-      // Group positions by symbol for aggregation
-      const symbolGroups = {};
-      
-      positions.forEach(position => {
-        const symbol = position.symbol;
-        if (!symbolGroups[symbol]) {
-          symbolGroups[symbol] = [];
-        }
-        symbolGroups[symbol].push(position);
-      });
-
-      // Aggregate each symbol group
-      const aggregatedPositions = [];
-      
-      for (const [symbol, positions] of Object.entries(symbolGroups)) {
-        if (positions.length === 1) {
-          // Single position, no aggregation needed - but still enrich
-          const enriched = await this.enrichPositions([positions[0]]);
-          aggregatedPositions.push(enriched[0]);
-        } else {
-          // Multiple positions for same symbol, aggregate them
-          const aggregated = await this.aggregateSymbolPositions(symbol, positions, accountMap);
-          aggregatedPositions.push(aggregated);
-        }
-      }
-
-      return aggregatedPositions;
     } catch (error) {
       logger.error('Error aggregating positions:', error);
       throw error;
     }
   }
 
-  // Aggregate multiple positions of the same symbol - FIXED to properly sum totalReceived
-  async aggregateSymbolPositions(symbol, positions, accountMap = {}) {
-    try {
-      // Get symbol info for the aggregated position
-      const symbolInfo = await Symbol.findOne({ symbol }).lean();
+  /**
+   * Aggregate all positions across all accounts
+   */
+  aggregateAllAccounts(positions, options = {}) {
+    const aggregated = new Map();
+
+    positions.forEach(position => {
+      const key = position.symbol;
       
-      // Initialize aggregated values
-      let totalShares = 0;
-      let totalCost = 0;
-      let totalMarketValue = 0;
-      let totalDividendsReceived = 0; // IMPORTANT: Initialize to 0
-      let totalMonthlyDividend = 0;
-      let totalAnnualDividend = 0;
-      let totalOpenPnl = 0;
-      let totalDayPnl = 0;
-      let totalClosedPnl = 0;
-      
-      const sourceAccounts = [];
-      const personNames = new Set();
-      let latestPrice = 0;
-      let latestMarketData = null;
-      let latestSyncedAt = null;
-
-      // Track dividend information
-      let lastDividendDate = null;
-      let lastDividendAmount = 0;
-      const dividendPerShareValues = [];
-
-      // Aggregate values from all positions
-      positions.forEach(position => {
-        totalShares += position.openQuantity || 0;
-        totalCost += position.totalCost || 0;
-        totalMarketValue += position.currentMarketValue || 0;
-        totalOpenPnl += position.openPnl || 0;
-        totalDayPnl += position.dayPnl || 0;
-        totalClosedPnl += position.closedPnl || 0;
-        
-        sourceAccounts.push(position.accountId);
-        personNames.add(position.personName);
-        
-        // Use the most recent price and market data
-        if (!latestSyncedAt || position.syncedAt > latestSyncedAt) {
-          latestPrice = position.currentPrice || 0;
-          latestMarketData = position.marketData;
-          latestSyncedAt = position.syncedAt;
-        }
-        
-        // CRITICAL FIX: Properly aggregate dividend data including totalReceived
-        if (position.dividendData) {
-          // Sum up the actual dividends received
-          totalDividendsReceived += position.dividendData.totalReceived || 0;
-          totalMonthlyDividend += position.dividendData.monthlyDividend || 0;
-          totalAnnualDividend += position.dividendData.annualDividend || 0;
-          
-          // Track last dividend info (use most recent)
-          if (position.dividendData.lastDividendDate) {
-            if (!lastDividendDate || new Date(position.dividendData.lastDividendDate) > new Date(lastDividendDate)) {
-              lastDividendDate = position.dividendData.lastDividendDate;
-              lastDividendAmount = position.dividendData.lastDividendAmount || 0;
-            }
-          }
-        }
-
-        // Collect dividendPerShare values from positions
-        if (position.dividendPerShare && position.dividendPerShare > 0) {
-          dividendPerShareValues.push(position.dividendPerShare);
-        }
-      });
-
-      // Log aggregation for debugging
-      if (totalDividendsReceived > 0) {
-        logger.info(`Aggregating ${symbol}: ${positions.length} positions, totalReceived: $${totalDividendsReceived.toFixed(2)}`);
-      }
-
-      // Calculate aggregated metrics
-      const weightedAverageCost = totalShares > 0 ? totalCost / totalShares : 0;
-      const totalReturnValue = totalOpenPnl + totalDividendsReceived; // Include actual dividends received
-      const totalReturnPercent = totalCost > 0 ? (totalReturnValue / totalCost) * 100 : 0;
-      const capitalGainPercent = totalCost > 0 ? (totalOpenPnl / totalCost) * 100 : 0;
-      const capitalGainValue = totalOpenPnl;
-      
-      // Dividend metrics using actual totalDividendsReceived
-      const dividendReturnPercent = totalCost > 0 ? (totalDividendsReceived / totalCost) * 100 : 0;
-      const yieldOnCost = totalCost > 0 && totalAnnualDividend > 0 
-        ? (totalAnnualDividend / totalCost) * 100 
-        : 0;
-
-      // Calculate dividend-adjusted cost
-      let dividendAdjustedCostPerShare = weightedAverageCost;
-      let dividendAdjustedCost = totalCost;
-      
-      if (totalDividendsReceived > 0 && totalShares > 0) {
-        dividendAdjustedCostPerShare = Math.max(0, weightedAverageCost - (totalDividendsReceived / totalShares));
-        dividendAdjustedCost = dividendAdjustedCostPerShare * totalShares;
-      }
-
-      // Calculate aggregated dividendPerShare
-      let aggregatedDividendPerShare = 0;
-      
-      if (dividendPerShareValues.length > 0) {
-        // Use the most common value, or if tied, the highest value
-        const valueCount = {};
-        dividendPerShareValues.forEach(val => {
-          valueCount[val] = (valueCount[val] || 0) + 1;
+      if (!aggregated.has(key)) {
+        aggregated.set(key, {
+          symbol: position.symbol,
+          symbolId: position.symbolId,
+          totalQuantity: 0,
+          totalCost: 0,
+          totalMarketValue: 0,
+          accounts: new Set(),
+          persons: new Set(),
+          accountDetails: [],
+          currentPrice: position.currentPrice,
+          currency: position.currency,
+          securityType: position.securityType,
+          lastUpdated: position.lastUpdated,
+          isDividendStock: position.isDividendStock || false,
+          dividendYield: position.dividendYield || 0,
+          annualDividend: position.annualDividend || 0
         });
-        
-        const sortedValues = Object.entries(valueCount)
-          .sort((a, b) => {
-            if (b[1] !== a[1]) return b[1] - a[1];
-            return parseFloat(b[0]) - parseFloat(a[0]);
-          });
-        
-        aggregatedDividendPerShare = parseFloat(sortedValues[0][0]);
-      }
-      
-      // If no dividendPerShare from positions, try symbol data
-      if (aggregatedDividendPerShare === 0 && symbolInfo) {
-        const freq = symbolInfo.dividendFrequency?.toLowerCase();
-        if (freq === 'monthly' || freq === 'quarterly') {
-          aggregatedDividendPerShare = symbolInfo.dividendPerShare || symbolInfo.dividend || 0;
-        }
       }
 
-      // Map each account's individual position for client display
-      const individualPositions = positions.map(pos => {
-        const account = accountMap[pos.accountId] || {};
-        return {
-          accountId: pos.accountId,
-          accountName: account.displayName || account.nickname || `Account ${pos.accountId}`,
-          accountType: account.type || account.clientAccountType,
-          shares: pos.openQuantity,
-          avgCost: pos.averageEntryPrice,
-          marketValue: pos.currentMarketValue,
-          totalCost: pos.totalCost,
-          openPnl: pos.openPnl,
-          // Include dividend info for transparency
-          dividendsReceived: pos.dividendData?.totalReceived || 0
-        };
+      const agg = aggregated.get(key);
+      agg.totalQuantity += position.openQuantity || 0;
+      agg.totalCost += (position.totalCost || 0);
+      agg.totalMarketValue += (position.currentMarketValue || 0);
+      agg.accounts.add(position.accountId);
+      
+      // Add person tracking
+      if (position.personName) {
+        agg.persons.add(position.personName);
+      }
+      
+      agg.accountDetails.push({
+        accountId: position.accountId,
+        accountName: position.accountName,
+        accountType: position.accountType,
+        personName: position.personName,
+        quantity: position.openQuantity,
+        cost: position.totalCost,
+        marketValue: position.currentMarketValue,
+        averageEntryPrice: position.averageEntryPrice,
+        unrealizedPnL: (position.currentMarketValue || 0) - (position.totalCost || 0),
+        unrealizedPnLPercent: position.totalCost > 0 
+          ? ((position.currentMarketValue - position.totalCost) / position.totalCost) * 100 
+          : 0
       });
 
-      // Determine if this is a dividend stock
-      const isDividendStock = totalAnnualDividend > 0 ||
-                             aggregatedDividendPerShare > 0 ||
-                             totalDividendsReceived > 0;
+      // Update price if more recent
+      if (position.lastUpdated > agg.lastUpdated) {
+        agg.currentPrice = position.currentPrice;
+        agg.lastUpdated = position.lastUpdated;
+      }
+    });
 
-      // Create aggregated position
-      const aggregatedPosition = {
-        symbol,
-        symbolId: positions[0].symbolId, // Same for all positions of this symbol
-        personName: personNames.size === 1 ? Array.from(personNames)[0] : 'Multiple',
-        accountId: 'AGGREGATED',
-      
-        // Aggregated quantities and values
-        openQuantity: totalShares,
-        closedQuantity: 0,
-        currentMarketValue: totalMarketValue,
-        currentPrice: latestPrice,
-        averageEntryPrice: weightedAverageCost,
-        totalCost: totalCost,
-        
-        // Aggregated P&L
-        openPnl: totalOpenPnl,
-        dayPnl: totalDayPnl,
-        closedPnl: totalClosedPnl,
-        
-        // Calculated fields
-        totalReturnPercent,
-        totalReturnValue,
-        capitalGainPercent,
-        capitalGainValue,
-        
-        // CRITICAL: Properly aggregated dividend data with actual totalReceived
-        dividendData: {
-          totalReceived: totalDividendsReceived, // This is now the sum of all actual dividends received
-          lastDividendAmount: lastDividendAmount,
-          lastDividendDate: lastDividendDate,
-          dividendReturnPercent,
-          yieldOnCost,
-          dividendAdjustedCost,
-          dividendAdjustedCostPerShare,
-          monthlyDividend: totalMonthlyDividend,
-          monthlyDividendPerShare: totalShares > 0 ? totalMonthlyDividend / totalShares : 0,
-          annualDividend: totalAnnualDividend,
-          annualDividendPerShare: totalShares > 0 ? totalAnnualDividend / totalShares : 0,
-          dividendFrequency: this.estimateDividendFrequency(positions)
-        },
-        
-        // Market data (use latest)
-        marketData: latestMarketData,
-        
-        // Aggregation metadata
-        isAggregated: true,
-        sourceAccounts,
-        numberOfAccounts: sourceAccounts.length,
-        individualPositions,
-        
-        // Timestamps
-        syncedAt: latestSyncedAt,
-        updatedAt: new Date(),
-        
-        // Additional fields
-        dividendPerShare: aggregatedDividendPerShare,
-        industrySector: symbolInfo?.industrySector || positions[0]?.industrySector,
-        industryGroup: symbolInfo?.industryGroup || positions[0]?.industryGroup,
-        currency: symbolInfo?.currency || positions[0]?.currency || 'CAD',
-        securityType: symbolInfo?.securityType || positions[0]?.securityType || 'Stock',
-        isDividendStock
+    // Convert to array and calculate additional metrics
+    return Array.from(aggregated.values()).map(pos => {
+      const avgPrice = pos.totalQuantity > 0 ? pos.totalCost / pos.totalQuantity : 0;
+      const unrealizedPnL = pos.totalMarketValue - pos.totalCost;
+      const unrealizedPnLPercent = pos.totalCost > 0 ? (unrealizedPnL / pos.totalCost) * 100 : 0;
+
+      return {
+        ...pos,
+        accounts: Array.from(pos.accounts),
+        persons: Array.from(pos.persons),
+        accountCount: pos.accounts.size,
+        personCount: pos.persons.size,
+        averageEntryPrice: avgPrice,
+        unrealizedPnL,
+        unrealizedPnLPercent,
+        dayPnL: 0, // This would need market data
+        dayPnLPercent: 0,
+        totalAnnualDividend: pos.isDividendStock ? pos.totalQuantity * pos.annualDividend : 0
       };
-
-      return aggregatedPosition;
-    } catch (error) {
-      logger.error(`Error aggregating positions for symbol ${symbol}:`, error);
-      throw error;
-    }
+    });
   }
 
-  // Get portfolio summary with aggregation
-  async getAggregatedSummary(viewMode, personName = null, accountId = null) {
-    try {
-      const positions = await this.aggregatePositions(viewMode, personName, accountId);
+  /**
+   * Return individual positions without aggregation
+   */
+  individualPositions(positions, options = {}) {
+    return positions.map(position => ({
+      symbol: position.symbol,
+      symbolId: position.symbolId,
+      accountId: position.accountId,
+      accountName: position.accountName,
+      accountType: position.accountType,
+      personName: position.personName,
+      quantity: position.openQuantity || 0,
+      averageEntryPrice: position.averageEntryPrice || 0,
+      currentPrice: position.currentPrice || 0,
+      totalCost: position.totalCost || 0,
+      marketValue: position.currentMarketValue || 0,
+      unrealizedPnL: (position.currentMarketValue || 0) - (position.totalCost || 0),
+      unrealizedPnLPercent: position.totalCost > 0 
+        ? ((position.currentMarketValue - position.totalCost) / position.totalCost) * 100 
+        : 0,
+      dayPnL: position.dayPnL || 0,
+      dayPnLPercent: position.dayPnLPercent || 0,
+      currency: position.currency,
+      securityType: position.securityType,
+      isDividendStock: position.isDividendStock || false,
+      dividendYield: position.dividendYield || 0,
+      annualDividend: position.annualDividend || 0,
+      lastUpdated: position.lastUpdated
+    }));
+  }
+
+  /**
+   * Aggregate positions by account
+   */
+  aggregateByAccount(positions, options = {}) {
+    const { accountId } = options;
+    
+    // Filter by specific account if provided
+    let filteredPositions = positions;
+    if (accountId) {
+      filteredPositions = positions.filter(p => String(p.accountId) === String(accountId));
+      logger.debug(`Filtered to ${filteredPositions.length} positions for account ${accountId}`);
       
-      if (positions.length === 0) {
-        return {
-          viewMode,
-          personName,
-          accountId,
-          totalInvestment: 0,
-          currentValue: 0,
-          totalReturnValue: 0,
-          totalReturnPercent: 0,
-          unrealizedPnl: 0,
-          totalDividends: 0,
-          monthlyDividendIncome: 0,
-          annualProjectedDividend: 0,
-          averageYieldPercent: 0,
-          yieldOnCostPercent: 0,
-          numberOfPositions: 0,
-          numberOfAccounts: 0,
-          numberOfDividendStocks: 0,
-          sectorAllocation: [],
-          currencyBreakdown: [],
-          personBreakdown: [],
-          accounts: []
-        };
+      // If specific account requested, return positions for that account
+      return this.individualPositions(filteredPositions, options);
+    }
+
+    // Group by account
+    const accountGroups = new Map();
+    
+    filteredPositions.forEach(position => {
+      const accId = position.accountId;
+      
+      if (!accountGroups.has(accId)) {
+        accountGroups.set(accId, {
+          accountId: accId,
+          accountName: position.accountName,
+          accountType: position.accountType,
+          personName: position.personName,
+          positions: [],
+          totalValue: 0,
+          totalCost: 0,
+          totalPnL: 0,
+          totalPnLPercent: 0,
+          cashBalances: {}
+        });
+      }
+      
+      const account = accountGroups.get(accId);
+      
+      const positionData = {
+        symbol: position.symbol,
+        symbolId: position.symbolId,
+        quantity: position.openQuantity || 0,
+        averageEntryPrice: position.averageEntryPrice || 0,
+        currentPrice: position.currentPrice || 0,
+        totalCost: position.totalCost || 0,
+        marketValue: position.currentMarketValue || 0,
+        unrealizedPnL: (position.currentMarketValue || 0) - (position.totalCost || 0),
+        unrealizedPnLPercent: position.totalCost > 0 
+          ? ((position.currentMarketValue - position.totalCost) / position.totalCost) * 100 
+          : 0,
+        currency: position.currency,
+        securityType: position.securityType,
+        isDividendStock: position.isDividendStock || false,
+        dividendYield: position.dividendYield || 0,
+        lastUpdated: position.lastUpdated
+      };
+      
+      account.positions.push(positionData);
+      account.totalValue += positionData.marketValue;
+      account.totalCost += positionData.totalCost;
+      account.totalPnL += positionData.unrealizedPnL;
+    });
+    
+    // Calculate account-level metrics
+    accountGroups.forEach(account => {
+      account.totalPnLPercent = account.totalCost > 0 
+        ? (account.totalPnL / account.totalCost) * 100 
+        : 0;
+      account.positionCount = account.positions.length;
+    });
+    
+    return Array.from(accountGroups.values());
+  }
+
+  /**
+   * Aggregate positions by person
+   */
+  aggregateByPerson(positions, options = {}) {
+    const { personName, aggregate = true } = options;
+    
+    // Filter by specific person if provided
+    let filteredPositions = positions;
+    if (personName) {
+      filteredPositions = positions.filter(p => p.personName === personName);
+      logger.debug(`Filtered to ${filteredPositions.length} positions for person ${personName}`);
+    }
+
+    if (!aggregate) {
+      return this.individualPositions(filteredPositions, options);
+    }
+
+    // Aggregate positions by symbol for the person
+    const aggregated = new Map();
+
+    filteredPositions.forEach(position => {
+      const key = position.symbol;
+      
+      if (!aggregated.has(key)) {
+        aggregated.set(key, {
+          symbol: position.symbol,
+          symbolId: position.symbolId,
+          personName: position.personName,
+          totalQuantity: 0,
+          totalCost: 0,
+          totalMarketValue: 0,
+          accounts: [],
+          currentPrice: position.currentPrice,
+          currency: position.currency,
+          securityType: position.securityType,
+          lastUpdated: position.lastUpdated,
+          isDividendStock: position.isDividendStock || false,
+          dividendYield: position.dividendYield || 0,
+          annualDividend: position.annualDividend || 0
+        });
       }
 
-      // Get accounts for additional data
-      let accountQuery = {};
-      switch (viewMode) {
-        case 'person':
-          if (personName) accountQuery.personName = personName;
-          break;
-        case 'account':
-          if (accountId) accountQuery.accountId = accountId;
-          break;
-        case 'all':
-        default:
-          // No additional filters
-          break;
-      }
-
-      const accounts = await Account.find(accountQuery).lean();
-
-      // Calculate summary metrics
-      let totalInvestment = 0;
-      let currentValue = 0;
-      let unrealizedPnl = 0;
-      let totalDividends = 0; // This will be actual dividends received
-      let monthlyDividendIncome = 0;
-      let annualProjectedDividend = 0;
+      const agg = aggregated.get(key);
+      agg.totalQuantity += position.openQuantity || 0;
+      agg.totalCost += position.totalCost || 0;
+      agg.totalMarketValue += position.currentMarketValue || 0;
       
-      const sectorMap = {};
-      const currencyMap = {};
-      const personMap = {};
-
-      positions.forEach(position => {
-        totalInvestment += position.totalCost || 0;
-        currentValue += position.currentMarketValue || 0;
-        unrealizedPnl += position.openPnl || 0;
-        
-        // CRITICAL FIX: Use totalReceived for actual dividends received
-        if (position.dividendData) {
-          totalDividends += position.dividendData.totalReceived || 0; // Actual dividends received
-          monthlyDividendIncome += position.dividendData.monthlyDividend || 0;
-          annualProjectedDividend += position.dividendData.annualDividend || 0;
-        }
-        
-        // Sector allocation
-        const sector = position.industrySector || position.securityType || 'Other';
-        sectorMap[sector] = (sectorMap[sector] || 0) + (position.currentMarketValue || 0);
-        
-        // Currency allocation
-        const currency = position.currency || 'CAD';
-        currencyMap[currency] = (currencyMap[currency] || 0) + (position.currentMarketValue || 0);
-        
-        // Person allocation (for "all" view)
-        if (viewMode === 'all' && position.personName !== 'Multiple') {
-          personMap[position.personName] = (personMap[position.personName] || 0) + (position.currentMarketValue || 0);
-        }
+      agg.accounts.push({
+        accountId: position.accountId,
+        accountName: position.accountName,
+        accountType: position.accountType,
+        quantity: position.openQuantity,
+        cost: position.totalCost,
+        marketValue: position.currentMarketValue,
+        averageEntryPrice: position.averageEntryPrice
       });
 
-      // Log summary for debugging
-      if (totalDividends > 0) {
-        logger.info(`Portfolio summary: ${positions.length} positions, totalDividends: $${totalDividends.toFixed(2)}`);
+      // Update price if more recent
+      if (position.lastUpdated > agg.lastUpdated) {
+        agg.currentPrice = position.currentPrice;
+        agg.lastUpdated = position.lastUpdated;
       }
+    });
 
-      const totalReturnValue = unrealizedPnl + totalDividends; // Include actual dividends in total return
-      const totalReturnPercent = totalInvestment > 0 ? (totalReturnValue / totalInvestment) * 100 : 0;
-      const averageYieldPercent = currentValue > 0 ? (annualProjectedDividend / currentValue) * 100 : 0;
-      const yieldOnCostPercent = totalInvestment > 0 ? (annualProjectedDividend / totalInvestment) * 100 : 0;
+    // Convert to array and calculate metrics
+    return Array.from(aggregated.values()).map(pos => {
+      const avgPrice = pos.totalQuantity > 0 ? pos.totalCost / pos.totalQuantity : 0;
+      const unrealizedPnL = pos.totalMarketValue - pos.totalCost;
+      const unrealizedPnLPercent = pos.totalCost > 0 ? (unrealizedPnL / pos.totalCost) * 100 : 0;
 
-      // Format allocations
-      const sectorAllocation = Object.entries(sectorMap).map(([sector, value]) => ({
-        sector,
-        value,
-        percentage: currentValue > 0 ? (value / currentValue) * 100 : 0
-      })).sort((a, b) => b.value - a.value);
+      return {
+        ...pos,
+        accountCount: pos.accounts.length,
+        averageEntryPrice: avgPrice,
+        unrealizedPnL,
+        unrealizedPnLPercent,
+        dayPnL: 0,
+        dayPnLPercent: 0,
+        totalAnnualDividend: pos.isDividendStock ? pos.totalQuantity * pos.annualDividend : 0
+      };
+    });
+  }
 
-      const currencyBreakdown = Object.entries(currencyMap).map(([currency, value]) => ({
-        currency,
-        value,
-        percentage: currentValue > 0 ? (value / currentValue) * 100 : 0
-      })).sort((a, b) => b.value - a.value);
+  /**
+   * Return individual positions for a person without aggregation
+   */
+  individualPositionsByPerson(positions, options = {}) {
+    const { personName } = options;
+    
+    let filteredPositions = positions;
+    if (personName) {
+      filteredPositions = positions.filter(p => p.personName === personName);
+    }
 
-      const personBreakdown = Object.entries(personMap).map(([person, value]) => ({
-        personName: person,
-        value,
-        percentage: currentValue > 0 ? (value / currentValue) * 100 : 0,
-        numberOfPositions: positions.filter(p => p.personName === person).length
-      })).sort((a, b) => b.value - a.value);
+    return this.individualPositions(filteredPositions, options);
+  }
 
-      // Enhanced accounts summary
-      const accountsSummary = accounts.map(account => {
-        const accountPositions = positions.filter(p => 
-          p.isAggregated ? p.sourceAccounts?.includes(account.accountId) : p.accountId === account.accountId
-        );
+  /**
+   * Aggregate positions by type (stock, ETF, etc.)
+   */
+  aggregateByType(positions, options = {}) {
+    const typeGroups = new Map();
+    
+    positions.forEach(position => {
+      const type = position.securityType || 'Unknown';
+      
+      if (!typeGroups.has(type)) {
+        typeGroups.set(type, {
+          type,
+          positions: [],
+          symbols: new Set(),
+          accounts: new Set(),
+          persons: new Set(),
+          totalValue: 0,
+          totalCost: 0,
+          totalPnL: 0,
+          totalPnLPercent: 0
+        });
+      }
+      
+      const group = typeGroups.get(type);
+      
+      const positionData = {
+        symbol: position.symbol,
+        symbolId: position.symbolId,
+        accountId: position.accountId,
+        accountName: position.accountName,
+        personName: position.personName,
+        quantity: position.openQuantity || 0,
+        averageEntryPrice: position.averageEntryPrice || 0,
+        currentPrice: position.currentPrice || 0,
+        totalCost: position.totalCost || 0,
+        marketValue: position.currentMarketValue || 0,
+        unrealizedPnL: (position.currentMarketValue || 0) - (position.totalCost || 0),
+        unrealizedPnLPercent: position.totalCost > 0 
+          ? ((position.currentMarketValue - position.totalCost) / position.totalCost) * 100 
+          : 0,
+        currency: position.currency
+      };
+      
+      group.positions.push(positionData);
+      group.symbols.add(position.symbol);
+      group.accounts.add(position.accountId);
+      if (position.personName) {
+        group.persons.add(position.personName);
+      }
+      group.totalValue += positionData.marketValue;
+      group.totalCost += positionData.totalCost;
+      group.totalPnL += positionData.unrealizedPnL;
+    });
+    
+    // Calculate type-level metrics
+    typeGroups.forEach(group => {
+      group.totalPnLPercent = group.totalCost > 0 
+        ? (group.totalPnL / group.totalCost) * 100 
+        : 0;
+      group.positionCount = group.positions.length;
+      group.symbolCount = group.symbols.size;
+      group.accountCount = group.accounts.size;
+      group.personCount = group.persons.size;
+      group.symbols = Array.from(group.symbols);
+      group.accounts = Array.from(group.accounts);
+      group.persons = Array.from(group.persons);
+    });
+    
+    return Array.from(typeGroups.values());
+  }
+
+  /**
+   * Get account summary
+   */
+  async getAccountSummary(accountId = null, personName = null) {
+    try {
+      // Build filter
+      const filter = {};
+      if (accountId) filter.accountId = accountId;
+      if (personName) filter.personName = personName;
+
+      const accounts = await this.dbManager.getAccounts(filter);
+      const positions = await this.dbManager.getPositions(filter);
+      const balances = await this.dbManager.getCashBalances(filter);
+      
+      const summaries = accounts.map(account => {
+        const accountPositions = positions.filter(p => p.accountId === account.accountId);
+        const accountBalances = balances.filter(b => b.accountId === account.accountId);
         
-        const accountValue = accountPositions.reduce((sum, p) => sum + (p.currentMarketValue || 0), 0);
-        const accountInvestment = accountPositions.reduce((sum, p) => sum + (p.totalCost || 0), 0);
-        const accountPnl = accountPositions.reduce((sum, p) => sum + (p.openPnl || 0), 0);
-        const accountDividends = accountPositions.reduce((sum, p) => sum + (p.dividendData?.totalReceived || 0), 0);
+        const totalValue = accountPositions.reduce((sum, p) => sum + (p.currentMarketValue || 0), 0);
+        const totalCost = accountPositions.reduce((sum, p) => sum + (p.totalCost || 0), 0);
+        const totalPnL = totalValue - totalCost;
+        const totalPnLPercent = totalCost > 0 ? (totalPnL / totalCost) * 100 : 0;
+        
+        // Group cash balances by currency
+        const cashByCurrency = {};
+        accountBalances.forEach(balance => {
+          if (!cashByCurrency[balance.currency]) {
+            cashByCurrency[balance.currency] = 0;
+          }
+          cashByCurrency[balance.currency] += balance.cash || 0;
+        });
+        
+        const totalCash = Object.values(cashByCurrency).reduce((sum, cash) => sum + cash, 0);
         
         return {
           accountId: account.accountId,
-          accountName: account.displayName || `${account.type} - ${account.accountId}`,
+          accountName: account.name,
           accountType: account.type,
-          totalInvestment: accountInvestment,
-          currentValue: accountValue,
-          unrealizedPnl: accountPnl,
-          dividendsReceived: accountDividends,
-          numberOfPositions: accountPositions.length,
-          returnPercent: accountInvestment > 0 ? ((accountPnl + accountDividends) / accountInvestment) * 100 : 0
+          accountNumber: account.number,
+          personName: account.personName,
+          status: account.status,
+          isPrimary: account.isPrimary,
+          isBilling: account.isBilling,
+          currency: account.currency,
+          positionCount: accountPositions.length,
+          totalValue,
+          totalCost,
+          totalPnL,
+          totalPnLPercent,
+          totalCash,
+          cashBalances: cashByCurrency,
+          totalAccountValue: totalValue + totalCash,
+          lastUpdated: account.lastUpdated
         };
       });
-
-      // Get account count
-      const accountIds = new Set();
-      positions.forEach(position => {
-        if (position.isAggregated) {
-          position.sourceAccounts?.forEach(acc => accountIds.add(acc));
-        } else {
-          accountIds.add(position.accountId);
-        }
-      });
-
-      return {
-        viewMode,
-        personName,
-        accountId,
-        totalInvestment,
-        currentValue,
-        totalReturnValue,
-        totalReturnPercent,
-        unrealizedPnl,
-        totalDividends, // Now properly shows actual dividends received
-        monthlyDividendIncome,
-        annualProjectedDividend,
-        averageYieldPercent,
-        yieldOnCostPercent,
-        numberOfPositions: positions.length,
-        numberOfAccounts: accountIds.size,
-        numberOfDividendStocks: positions.filter(p => 
-          p.dividendData && (p.dividendData.annualDividend > 0 || p.dividendData.totalReceived > 0)
-        ).length,
-        sectorAllocation,
-        currencyBreakdown,
-        personBreakdown: viewMode === 'all' ? personBreakdown : [],
-        accounts: accountsSummary,
-        aggregationInfo: {
-          hasAggregatedPositions: positions.some(p => p.isAggregated),
-          totalAggregatedSymbols: positions.filter(p => p.isAggregated).length
-        }
-      };
+      
+      return accountId ? summaries[0] : summaries;
     } catch (error) {
-      logger.error('Error getting aggregated summary:', error);
+      logger.error('Error getting account summary:', error);
       throw error;
     }
   }
 
-  // Enrich positions with additional symbol information
-  async enrichPositions(positions) {
+  /**
+   * Aggregate cash balances based on view mode
+   */
+  async aggregateCashBalances(balances, viewMode = 'all', options = {}) {
     try {
-      const symbolIds = [...new Set(positions.map(p => p.symbolId))];
-      const symbols = await Symbol.find({ symbolId: { $in: symbolIds } }).lean();
-      const symbolMap = {};
-      symbols.forEach(sym => { symbolMap[sym.symbolId] = sym; });
-
-      return positions.map(position => {
-        const symbolInfo = symbolMap[position.symbolId];
-        
-        // Keep all existing dividend data intact
-        const actualDividendData = position.dividendData || {};
-        
-        // Determine dividendPerShare
-        let dividendPerShare = position.dividendPerShare || 0;
-        
-        if (dividendPerShare === 0 && symbolInfo) {
-          const freq = symbolInfo.dividendFrequency?.toLowerCase();
-          if (freq === 'monthly' || freq === 'quarterly') {
-            dividendPerShare = symbolInfo.dividendPerShare || symbolInfo.dividend || 0;
-          }
-        }
-        
-        // Check if this is a dividend stock based on actual data
-        const isDividendStock = (actualDividendData.annualDividend > 0) ||
-                               (actualDividendData.totalReceived > 0) ||
-                               dividendPerShare > 0;
-        
-        return {
-          ...position,
-          dividendPerShare: isDividendStock ? dividendPerShare : 0,
-          industrySector: position.industrySector || symbolInfo?.industrySector,
-          industryGroup: position.industryGroup || symbolInfo?.industryGroup,
-          industrySubGroup: symbolInfo?.industrySubGroup,
-          currency: position.currency || symbolInfo?.currency || 'CAD',
-          securityType: symbolInfo?.securityType || position.securityType,
-          isDividendStock,
-          // Preserve the actual dividend data
-          dividendData: actualDividendData
-        };
-      });
+      switch (viewMode) {
+        case 'all':
+          return this.aggregateAllCashBalances(balances, options);
+        case 'account':
+          return this.aggregateCashByAccount(balances, options);
+        case 'person':
+          return this.aggregateCashByPerson(balances, options);
+        default:
+          return this.aggregateAllCashBalances(balances, options);
+      }
     } catch (error) {
-      logger.error('Error enriching positions:', error);
-      return positions;
+      logger.error('Error aggregating cash balances:', error);
+      throw error;
     }
   }
 
-  // Helper method to estimate dividend frequency
-  estimateDividendFrequency(positions) {
-    const frequencies = positions
-      .map(p => p.dividendData?.dividendFrequency)
-      .filter(f => f && f > 0);
+  /**
+   * Aggregate all cash balances across all accounts
+   */
+  aggregateAllCashBalances(balances, options = {}) {
+    const { currency } = options;
     
-    if (frequencies.length === 0) return 0;
-    
-    // Return the most common frequency
-    const frequencyCount = {};
-    frequencies.forEach(f => {
-      frequencyCount[f] = (frequencyCount[f] || 0) + 1;
-    });
-    
-    const sortedFrequencies = Object.entries(frequencyCount)
-      .sort((a, b) => b[1] - a[1]);
-    
-    return parseInt(sortedFrequencies[0][0]);
-  }
+    // Filter by currency if specified
+    let filteredBalances = balances;
+    if (currency) {
+      filteredBalances = balances.filter(b => b.currency === currency);
+    }
 
-  // Get account dropdown options
-  async getAccountDropdownOptions() {
-    try {
-      const persons = await Person.find({ isActive: true }).lean();
-      const accounts = await Account.find({}).lean();
+    // Group by currency
+    const currencyGroups = new Map();
+    const accountDetails = [];
+    
+    filteredBalances.forEach(balance => {
+      const curr = balance.currency;
       
-      const options = [];
-      
-      // Add "All Accounts" option
-      options.push({
-        value: 'all',
-        label: 'All Accounts',
-        type: 'all',
-        personName: null,
-        accountId: null
-      });
-      
-      // Add person-specific options
-      for (const person of persons) {
-        const personAccounts = accounts.filter(acc => acc.personName === person.personName);
-        
-        if (personAccounts.length > 0) {
-          // Add "All Accounts - PersonName" option
-          options.push({
-            value: `person-${person.personName}`,
-            label: `All Accounts - ${person.personName}`,
-            type: 'person',
-            personName: person.personName,
-            accountId: null
-          });
-          
-          // Add individual account options
-          personAccounts.forEach(account => {
-            options.push({
-              value: `account-${account.accountId}`,
-              label: `${person.personName} ${account.type} - ${account.accountId}`,
-              type: 'account',
-              personName: person.personName,
-              accountId: account.accountId
-            });
-          });
-        }
+      if (!currencyGroups.has(curr)) {
+        currencyGroups.set(curr, {
+          currency: curr,
+          totalCash: 0,
+          totalMarketValue: 0,
+          totalCombined: 0,
+          accounts: new Set(),
+          persons: new Set()
+        });
       }
       
-      return options;
-    } catch (error) {
-      logger.error('Error getting account dropdown options:', error);
-      throw error;
+      const group = currencyGroups.get(curr);
+      group.totalCash += balance.cash || 0;
+      group.totalMarketValue += balance.marketValue || 0;
+      group.totalCombined += balance.totalEquity || 0;
+      group.accounts.add(balance.accountId);
+      if (balance.personName) {
+        group.persons.add(balance.personName);
+      }
+      
+      accountDetails.push({
+        accountId: balance.accountId,
+        accountName: balance.accountName,
+        accountType: balance.accountType,
+        personName: balance.personName,
+        currency: balance.currency,
+        cash: balance.cash,
+        marketValue: balance.marketValue,
+        totalEquity: balance.totalEquity,
+        buyingPower: balance.buyingPower
+      });
+    });
+    
+    const currencies = Array.from(currencyGroups.values()).map(group => ({
+      ...group,
+      accountCount: group.accounts.size,
+      personCount: group.persons.size,
+      accounts: Array.from(group.accounts),
+      persons: Array.from(group.persons)
+    }));
+    
+    // Calculate grand totals (simplified - would need exchange rates for accuracy)
+    const grandTotalCash = currencies.reduce((sum, c) => sum + c.totalCash, 0);
+    const grandTotalMarketValue = currencies.reduce((sum, c) => sum + c.totalMarketValue, 0);
+    const grandTotalCombined = currencies.reduce((sum, c) => sum + c.totalCombined, 0);
+    
+    return {
+      viewMode: 'all',
+      currencies,
+      accountDetails,
+      summary: {
+        totalAccounts: new Set(accountDetails.map(a => a.accountId)).size,
+        totalPersons: new Set(accountDetails.map(a => a.personName).filter(p => p)).size,
+        grandTotalCash,
+        grandTotalMarketValue,
+        grandTotalCombined
+      }
+    };
+  }
+
+  /**
+   * Aggregate cash balances by account
+   */
+  aggregateCashByAccount(balances, options = {}) {
+    const { accountId } = options;
+    
+    // Filter by specific account if provided
+    let filteredBalances = balances;
+    if (accountId) {
+      filteredBalances = balances.filter(b => String(b.accountId) === String(accountId));
     }
+
+    // Group by account
+    const accountGroups = new Map();
+    
+    filteredBalances.forEach(balance => {
+      const accId = balance.accountId;
+      
+      if (!accountGroups.has(accId)) {
+        accountGroups.set(accId, {
+          accountId: accId,
+          accountName: balance.accountName,
+          accountType: balance.accountType,
+          personName: balance.personName,
+          currencies: []
+        });
+      }
+      
+      const account = accountGroups.get(accId);
+      account.currencies.push({
+        currency: balance.currency,
+        cash: balance.cash,
+        marketValue: balance.marketValue,
+        totalEquity: balance.totalEquity,
+        buyingPower: balance.buyingPower
+      });
+    });
+    
+    return Array.from(accountGroups.values());
+  }
+
+  /**
+   * Aggregate cash balances by person
+   */
+  aggregateCashByPerson(balances, options = {}) {
+    const { personName } = options;
+    
+    // Filter by specific person if provided
+    let filteredBalances = balances;
+    if (personName) {
+      filteredBalances = balances.filter(b => b.personName === personName);
+    }
+
+    // Group by person and currency
+    const personGroups = new Map();
+    
+    filteredBalances.forEach(balance => {
+      const person = balance.personName || 'Unknown';
+      
+      if (!personGroups.has(person)) {
+        personGroups.set(person, {
+          personName: person,
+          accounts: new Map(),
+          currencies: new Map(),
+          totalCash: 0,
+          totalMarketValue: 0,
+          totalEquity: 0
+        });
+      }
+      
+      const personData = personGroups.get(person);
+      
+      // Track by account
+      if (!personData.accounts.has(balance.accountId)) {
+        personData.accounts.set(balance.accountId, {
+          accountId: balance.accountId,
+          accountName: balance.accountName,
+          accountType: balance.accountType,
+          balances: []
+        });
+      }
+      
+      personData.accounts.get(balance.accountId).balances.push({
+        currency: balance.currency,
+        cash: balance.cash,
+        marketValue: balance.marketValue,
+        totalEquity: balance.totalEquity
+      });
+      
+      // Track by currency
+      if (!personData.currencies.has(balance.currency)) {
+        personData.currencies.set(balance.currency, {
+          currency: balance.currency,
+          totalCash: 0,
+          totalMarketValue: 0,
+          totalEquity: 0
+        });
+      }
+      
+      const currData = personData.currencies.get(balance.currency);
+      currData.totalCash += balance.cash || 0;
+      currData.totalMarketValue += balance.marketValue || 0;
+      currData.totalEquity += balance.totalEquity || 0;
+      
+      personData.totalCash += balance.cash || 0;
+      personData.totalMarketValue += balance.marketValue || 0;
+      personData.totalEquity += balance.totalEquity || 0;
+    });
+    
+    // Convert to array format
+    return Array.from(personGroups.values()).map(person => ({
+      personName: person.personName,
+      accounts: Array.from(person.accounts.values()),
+      currencies: Array.from(person.currencies.values()),
+      accountCount: person.accounts.size,
+      totalCash: person.totalCash,
+      totalMarketValue: person.totalMarketValue,
+      totalEquity: person.totalEquity
+    }));
   }
 }
 
-module.exports = new AccountAggregator();
+module.exports = AccountAggregator;
