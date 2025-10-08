@@ -1,12 +1,16 @@
 // services/portfolioCalculator.js
 const logger = require('../utils/logger');
+const Position = require('../models/Position');
+const Account = require('../models/Account');
+const Activity = require('../models/Activity');
+const PortfolioSnapshot = require('../models/PortfolioSnapshot');
+const Symbol = require('../models/Symbol');
+const Person = require('../models/Person');
 const AccountAggregator = require('./accountAggregator');
 
 class PortfolioCalculatorService {
-  constructor(dbManager, queueManager) {
-    this.dbManager = dbManager;
-    this.queueManager = queueManager;
-    this.accountAggregator = new AccountAggregator(dbManager);
+  constructor() {
+    this.accountAggregator = new AccountAggregator();
   }
 
   /**
@@ -29,10 +33,12 @@ class PortfolioCalculatorService {
       const filter = {};
       if (accountId) filter.accountId = accountId;
       if (personName) filter.personName = personName;
-      filter.includeClosedPositions = includeClosedPositions;
+      if (!includeClosedPositions) {
+        filter.openQuantity = { $gt: 0 };
+      }
 
       // Get positions from database
-      let positions = await this.dbManager.getPositions(filter);
+      let positions = await Position.find(filter).lean();
 
       // Filter for dividend stocks if requested
       if (dividendStocksOnly) {
@@ -76,27 +82,15 @@ class PortfolioCalculatorService {
         const totalPnLPercent = totalCost > 0 ? (totalPnL / totalCost) * 100 : 0;
 
         // Get account info
-        const accounts = await this.dbManager.getAccounts({ accountId });
-        const account = accounts[0] || {};
-
-        // Get cash balances for the specific account
-        const cashBalances = await this.dbManager.getCashBalances({ accountId });
+        const account = await Account.findOne({ accountId }).lean();
         
-        // Calculate total cash from all currencies for this account
+        // Extract cash balances
         let totalCash = 0;
         let cashByCurrency = {};
         
-        if (cashBalances && cashBalances.length > 0) {
-          cashBalances.forEach(balance => {
-            const currency = balance.currency || 'CAD';
-            const cashAmount = balance.cash || 0;
-            
-            if (!cashByCurrency[currency]) {
-              cashByCurrency[currency] = 0;
-            }
-            cashByCurrency[currency] += cashAmount;
-            totalCash += cashAmount;
-          });
+        if (account?.balances?.combinedBalances) {
+          totalCash = account.balances.combinedBalances.cash || 0;
+          cashByCurrency[account.balances.combinedBalances.currency || 'CAD'] = totalCash;
         }
 
         // Get dividend information
@@ -115,9 +109,9 @@ class PortfolioCalculatorService {
         return {
           viewMode,
           accountId,
-          accountName: account.displayName || account.name || account.accountId,
-          accountType: account.type,
-          personName: account.personName || personName,
+          accountName: account?.displayName || account?.accountId,
+          accountType: account?.type,
+          personName: account?.personName || personName,
           totalValue,
           totalCost,
           totalPnL,
@@ -128,7 +122,7 @@ class PortfolioCalculatorService {
           positionCount: positions.length,
           positions,
           dayPnL: positions.reduce((sum, p) => sum + (p.dayPnL || 0), 0),
-          dayPnLPercent: 0, // Would need previous day's value
+          dayPnLPercent: 0,
           dividendStocks: dividendPositions.length,
           totalDividendsReceived,
           annualDividendProjected,
@@ -137,7 +131,6 @@ class PortfolioCalculatorService {
       } else if (viewMode === 'person' && personName) {
         // Person view
         if (!aggregate) {
-          // Individual positions for person
           return {
             viewMode,
             personName,
@@ -155,25 +148,20 @@ class PortfolioCalculatorService {
         const totalPnLPercent = totalCost > 0 ? (totalPnL / totalCost) * 100 : 0;
 
         // Get person's accounts
-        const accounts = await this.dbManager.getAccounts({ personName });
+        const accounts = await Account.find({ personName }).lean();
         
-        // Get cash balances for the person
-        const cashBalances = await this.dbManager.getCashBalances({ personName });
+        // Calculate total cash
         let totalCash = 0;
         let cashByCurrency = {};
         
-        if (cashBalances && cashBalances.length > 0) {
-          cashBalances.forEach(balance => {
-            const currency = balance.currency || 'CAD';
-            const cashAmount = balance.cash || 0;
-            
-            if (!cashByCurrency[currency]) {
-              cashByCurrency[currency] = 0;
-            }
-            cashByCurrency[currency] += cashAmount;
-            totalCash += cashAmount;
-          });
-        }
+        accounts.forEach(account => {
+          if (account?.balances?.combinedBalances) {
+            const currency = account.balances.combinedBalances.currency || 'CAD';
+            const cash = account.balances.combinedBalances.cash || 0;
+            cashByCurrency[currency] = (cashByCurrency[currency] || 0) + cash;
+            totalCash += cash;
+          }
+        });
 
         // Get dividend information
         const dividendPositions = positions.filter(p => 
@@ -202,7 +190,7 @@ class PortfolioCalculatorService {
           accountCount: accounts.length,
           accounts: accounts.map(a => ({
             accountId: a.accountId,
-            accountName: a.displayName || a.name || a.accountId,
+            accountName: a.displayName || a.accountId,
             accountType: a.type
           })),
           positionCount: positions.length,
@@ -215,21 +203,9 @@ class PortfolioCalculatorService {
           annualDividendProjected,
           lastUpdated: new Date().toISOString()
         };
-      } else if (viewMode === 'type') {
-        // Grouped by type view
-        return {
-          viewMode,
-          types: positions,
-          totalTypes: positions.length,
-          grandTotalValue: positions.reduce((sum, t) => sum + (t.totalValue || 0), 0),
-          grandTotalCost: positions.reduce((sum, t) => sum + (t.totalCost || 0), 0),
-          grandTotalPnL: positions.reduce((sum, t) => sum + (t.totalPnL || 0), 0),
-          lastUpdated: new Date().toISOString()
-        };
       } else {
-        // Default 'all' view - aggregated across everything
+        // Default 'all' view
         if (!aggregate) {
-          // Return individual positions
           return {
             viewMode,
             aggregate: false,
@@ -245,25 +221,20 @@ class PortfolioCalculatorService {
         const totalPnLPercent = totalCost > 0 ? (totalPnL / totalCost) * 100 : 0;
 
         // Get all accounts
-        const accounts = await this.dbManager.getAccounts();
+        const accounts = await Account.find({}).lean();
         
-        // Get all cash balances
-        const cashBalances = await this.dbManager.getCashBalances();
+        // Calculate total cash
         let totalCash = 0;
         let cashByCurrency = {};
         
-        if (cashBalances && cashBalances.length > 0) {
-          cashBalances.forEach(balance => {
-            const currency = balance.currency || 'CAD';
-            const cashAmount = balance.cash || 0;
-            
-            if (!cashByCurrency[currency]) {
-              cashByCurrency[currency] = 0;
-            }
-            cashByCurrency[currency] += cashAmount;
-            totalCash += cashAmount;
-          });
-        }
+        accounts.forEach(account => {
+          if (account?.balances?.combinedBalances) {
+            const currency = account.balances.combinedBalances.currency || 'CAD';
+            const cash = account.balances.combinedBalances.cash || 0;
+            cashByCurrency[currency] = (cashByCurrency[currency] || 0) + cash;
+            totalCash += cash;
+          }
+        });
 
         // Get unique persons
         const uniquePersons = new Set(accounts.map(a => a.personName).filter(p => p));
@@ -323,26 +294,19 @@ class PortfolioCalculatorService {
    */
   async filterDividendStocks(positions) {
     try {
-      // Filter positions that have dividend data
       return positions.filter(p => {
-        // Check if position is marked as dividend stock
         if (p.isDividendStock) return true;
-        
-        // Check if position has dividend data with actual dividends
         if (p.dividendData) {
           if (p.dividendData.totalReceived > 0) return true;
           if (p.dividendData.annualDividend > 0) return true;
           if (p.dividendData.annualDividendPerShare > 0) return true;
         }
-        
-        // Check if position has dividendPerShare
         if (p.dividendPerShare > 0) return true;
-        
         return false;
       });
     } catch (error) {
       logger.error('Error filtering dividend stocks:', error);
-      return positions; // Return all positions if error
+      return positions;
     }
   }
 
@@ -367,9 +331,11 @@ class PortfolioCalculatorService {
       if (accountId) filter.accountId = accountId;
       if (personName) filter.personName = personName;
       if (symbol) filter.symbol = symbol;
-      filter.includeClosedPositions = includeClosedPositions;
+      if (!includeClosedPositions) {
+        filter.openQuantity = { $gt: 0 };
+      }
 
-      let positions = await this.dbManager.getPositions(filter);
+      let positions = await Position.find(filter).lean();
 
       // Aggregate based on view mode
       positions = this.accountAggregator.aggregatePositions(
@@ -400,6 +366,140 @@ class PortfolioCalculatorService {
   }
 
   /**
+   * Enrich a single position with calculated fields
+   */
+  enrichPosition(position) {
+    return {
+      symbol: position.symbol,
+      symbolId: position.symbolId,
+      accountId: position.accountId,
+      personName: position.personName,
+      quantity: position.openQuantity || 0,
+      averageEntryPrice: position.averageEntryPrice || 0,
+      currentPrice: position.currentPrice || 0,
+      totalCost: position.totalCost || 0,
+      marketValue: position.currentMarketValue || 0,
+      unrealizedPnL: (position.currentMarketValue || 0) - (position.totalCost || 0),
+      unrealizedPnLPercent: position.totalCost > 0 
+        ? ((position.currentMarketValue - position.totalCost) / position.totalCost) * 100 
+        : 0,
+      dayPnL: position.dayPnL || 0,
+      dayPnLPercent: position.dayPnLPercent || 0,
+      currency: position.currency,
+      securityType: position.securityType,
+      isDividendStock: position.isDividendStock || false,
+      dividendYield: position.dividendYield || 0,
+      annualDividend: position.annualDividend || 0,
+      dividendData: position.dividendData,
+      lastUpdated: position.updatedAt
+    };
+  }
+
+  /**
+   * Aggregate positions by symbol
+   */
+  aggregatePositionsBySymbol(positions, symbol) {
+    const aggregated = {
+      symbol: positions[0].symbol,
+      symbolId: positions[0].symbolId,
+      totalQuantity: 0,
+      totalCost: 0,
+      totalMarketValue: 0,
+      currentPrice: positions[0].currentPrice,
+      currency: positions[0].currency,
+      securityType: positions[0].securityType,
+      isDividendStock: positions[0].isDividendStock || false,
+      dividendYield: positions[0].dividendYield || 0,
+      annualDividend: positions[0].annualDividend || 0,
+      accounts: [],
+      persons: new Set(),
+      lastUpdated: positions[0].updatedAt
+    };
+
+    positions.forEach(position => {
+      aggregated.totalQuantity += position.openQuantity || 0;
+      aggregated.totalCost += position.totalCost || 0;
+      aggregated.totalMarketValue += position.currentMarketValue || 0;
+      
+      if (position.personName) {
+        aggregated.persons.add(position.personName);
+      }
+      
+      aggregated.accounts.push({
+        accountId: position.accountId,
+        personName: position.personName,
+        quantity: position.openQuantity,
+        cost: position.totalCost,
+        marketValue: position.currentMarketValue,
+        averageEntryPrice: position.averageEntryPrice,
+        unrealizedPnL: (position.currentMarketValue || 0) - (position.totalCost || 0),
+        unrealizedPnLPercent: position.totalCost > 0 
+          ? ((position.currentMarketValue - position.totalCost) / position.totalCost) * 100 
+          : 0,
+        dividendData: position.dividendData
+      });
+
+      // Update price if more recent
+      if (position.updatedAt > aggregated.lastUpdated) {
+        aggregated.currentPrice = position.currentPrice;
+        aggregated.lastUpdated = position.updatedAt;
+      }
+    });
+
+    // Calculate aggregate metrics
+    aggregated.averageEntryPrice = aggregated.totalQuantity > 0 
+      ? aggregated.totalCost / aggregated.totalQuantity 
+      : 0;
+    aggregated.unrealizedPnL = aggregated.totalMarketValue - aggregated.totalCost;
+    aggregated.unrealizedPnLPercent = aggregated.totalCost > 0 
+      ? (aggregated.unrealizedPnL / aggregated.totalCost) * 100 
+      : 0;
+    aggregated.accountCount = aggregated.accounts.length;
+    aggregated.personCount = aggregated.persons.size;
+    aggregated.persons = Array.from(aggregated.persons);
+    aggregated.totalAnnualDividend = aggregated.isDividendStock 
+      ? aggregated.totalQuantity * aggregated.annualDividend 
+      : 0;
+
+    return aggregated;
+  }
+
+  /**
+   * Extract cash balances from accounts
+   */
+  extractCashBalances(accounts) {
+    const balances = [];
+    
+    accounts.forEach(account => {
+      if (account?.balances?.perCurrencyBalances) {
+        account.balances.perCurrencyBalances.forEach(balance => {
+          balances.push({
+            accountId: account.accountId,
+            personName: account.personName,
+            currency: balance.currency,
+            cash: balance.cash,
+            marketValue: balance.marketValue,
+            totalEquity: balance.totalEquity,
+            buyingPower: balance.buyingPower
+          });
+        });
+      } else if (account?.balances?.combinedBalances) {
+        balances.push({
+          accountId: account.accountId,
+          personName: account.personName,
+          currency: account.balances.combinedBalances.currency || 'CAD',
+          cash: account.balances.combinedBalances.cash || 0,
+          marketValue: account.balances.combinedBalances.marketValue || 0,
+          totalEquity: account.balances.combinedBalances.totalEquity || 0,
+          buyingPower: account.balances.combinedBalances.buyingPower || 0
+        });
+      }
+    });
+    
+    return balances;
+  }
+
+  /**
    * Get dividend calendar
    */
   async getDividendCalendar(options = {}) {
@@ -414,27 +514,35 @@ class PortfolioCalculatorService {
       } = options;
 
       // Build filter
-      const filter = {};
-      if (accountId) filter.accountId = accountId;
-      if (personName) filter.personName = personName;
-      if (startDate) filter.startDate = startDate;
-      if (endDate) filter.endDate = endDate;
+      const positionFilter = {};
+      if (accountId) positionFilter.accountId = accountId;
+      if (personName) positionFilter.personName = personName;
 
-      // Get positions to know which symbols to check
-      const positions = await this.dbManager.getPositions(filter);
+      // Get positions
+      const positions = await Position.find(positionFilter).lean();
       const symbols = [...new Set(positions.map(p => p.symbol))];
 
-      // Get dividend info
-      const dividendInfo = await this.dbManager.getDividendInfo(symbols);
-      
-      // Get historical dividends
-      const historicalDividends = await this.dbManager.getDividends(filter);
+      // Get dividend activities
+      const activityFilter = {
+        type: 'Dividend',
+        symbol: { $in: symbols }
+      };
+      if (accountId) activityFilter.accountId = accountId;
+      if (personName) activityFilter.personName = personName;
+      if (startDate || endDate) {
+        activityFilter.transactionDate = {};
+        if (startDate) activityFilter.transactionDate.$gte = new Date(startDate);
+        if (endDate) activityFilter.transactionDate.$lte = new Date(endDate);
+      }
+
+      const dividendActivities = await Activity.find(activityFilter)
+        .sort({ transactionDate: -1 })
+        .lean();
 
       // Build calendar
       const calendar = this.buildDividendCalendar(
         positions,
-        dividendInfo,
-        historicalDividends,
+        dividendActivities,
         { startDate, endDate, groupBy }
       );
 
@@ -444,9 +552,9 @@ class PortfolioCalculatorService {
         personName,
         calendar,
         summary: {
-          totalAnnualDividends: this.calculateAnnualDividends(positions, dividendInfo),
-          averageYield: this.calculateAverageYield(positions, dividendInfo),
-          dividendStockCount: dividendInfo.filter(d => d.isDividendStock).length
+          totalAnnualDividends: this.calculateAnnualDividends(positions),
+          averageYield: this.calculateAverageYield(positions),
+          dividendStockCount: positions.filter(p => p.isDividendStock).length
         }
       };
     } catch (error) {
@@ -473,14 +581,18 @@ class PortfolioCalculatorService {
 
       // Build filter
       const filter = {
-        startDate: startDate.toISOString(),
-        endDate: endDate.toISOString()
+        date: { 
+          $gte: startDate,
+          $lte: endDate
+        }
       };
       if (accountId) filter.accountId = accountId;
       if (personName) filter.personName = personName;
 
       // Get snapshots for the period
-      const snapshots = await this.dbManager.getPortfolioSnapshots(filter);
+      const snapshots = await PortfolioSnapshot.find(filter)
+        .sort({ date: 1 })
+        .lean();
 
       if (snapshots.length === 0) {
         return {
@@ -529,19 +641,24 @@ class PortfolioCalculatorService {
       } = options;
 
       // Build filter
-      const filter = {};
+      const filter = { type: 'Dividend' };
       if (accountId) filter.accountId = accountId;
       if (personName) filter.personName = personName;
-      if (startDate) filter.startDate = startDate;
-      if (endDate) filter.endDate = endDate;
+      if (startDate || endDate) {
+        filter.transactionDate = {};
+        if (startDate) filter.transactionDate.$gte = new Date(startDate);
+        if (endDate) filter.transactionDate.$lte = new Date(endDate);
+      }
 
-      const dividends = await this.dbManager.getDividends(filter);
+      const dividends = await Activity.find(filter)
+        .sort({ transactionDate: -1 })
+        .lean();
 
       // Group dividends
       const grouped = this.groupDividendData(dividends, groupBy);
       
       // Calculate summary
-      const totalDividends = dividends.reduce((sum, d) => sum + (d.amount || 0), 0);
+      const totalDividends = dividends.reduce((sum, d) => sum + Math.abs(d.netAmount || 0), 0);
       const uniqueSymbols = new Set(dividends.map(d => d.symbol)).size;
       const uniqueAccounts = new Set(dividends.map(d => d.accountId)).size;
       const uniquePersons = new Set(dividends.map(d => d.personName).filter(p => p)).size;
@@ -578,9 +695,8 @@ class PortfolioCalculatorService {
       if (accountId) filter.accountId = accountId;
       if (personName) filter.personName = personName;
 
-      const positions = await this.dbManager.getPositions(filter);
+      const positions = await Position.find(filter).lean();
       
-      // Get additional data based on groupBy
       let allocation = [];
       
       switch (groupBy) {
@@ -636,52 +752,41 @@ class PortfolioCalculatorService {
       if (accountId) filter.accountId = accountId;
       if (personName) filter.personName = personName;
 
-      const accounts = await this.dbManager.getAccounts(filter);
-      const snapshots = [];
+      const positions = await Position.find(filter).lean();
+      const accounts = await Account.find(filter).lean();
 
-      for (const account of accounts) {
-        const positions = await this.dbManager.getPositions({ 
-          accountId: account.accountId 
-        });
+      const totalValue = positions.reduce((sum, p) => sum + (p.currentMarketValue || 0), 0);
+      const totalCost = positions.reduce((sum, p) => sum + (p.totalCost || 0), 0);
+      const unrealizedPnl = positions.reduce((sum, p) => sum + (p.openPnl || 0), 0);
+      const totalDividends = positions.reduce((sum, p) => 
+        sum + (p.dividendData?.totalReceived || 0), 0);
+      
+      const totalReturnValue = unrealizedPnl + totalDividends;
+      const totalReturnPercent = totalCost > 0 ? 
+        (totalReturnValue / totalCost) * 100 : 0;
 
-        const totalValue = positions.reduce((sum, p) => sum + (p.currentMarketValue || 0), 0);
-        const totalCost = positions.reduce((sum, p) => sum + (p.totalCost || 0), 0);
-        const totalPnL = totalValue - totalCost;
-        const totalPnLPercent = totalCost > 0 ? (totalPnL / totalCost) * 100 : 0;
+      const snapshot = new PortfolioSnapshot({
+        accountId,
+        personName,
+        viewMode: accountId ? 'account' : (personName ? 'person' : 'all'),
+        date: new Date(),
+        totalInvestment: totalCost,
+        currentValue: totalValue,
+        totalReturnValue,
+        totalReturnPercent,
+        unrealizedPnl,
+        totalDividends,
+        numberOfPositions: positions.length,
+        numberOfAccounts: accounts.length,
+        numberOfDividendStocks: positions.filter(p => 
+          p.dividendData && p.dividendData.annualDividend > 0
+        ).length,
+        createdAt: new Date()
+      });
 
-        // Get cash balances
-        const cashBalances = await this.dbManager.getCashBalances({ 
-          accountId: account.accountId 
-        });
-        const totalCash = cashBalances.reduce((sum, b) => sum + (b.cash || 0), 0);
-
-        const snapshot = {
-          accountId: account.accountId,
-          accountName: account.name,
-          accountType: account.type,
-          personName: account.personName,
-          snapshotDate: new Date().toISOString(),
-          totalValue,
-          totalCost,
-          totalPnL,
-          totalPnLPercent,
-          totalCash,
-          totalAccountValue: totalValue + totalCash,
-          positionCount: positions.length,
-          positions: positions.map(p => ({
-            symbol: p.symbol,
-            quantity: p.openQuantity,
-            marketValue: p.currentMarketValue,
-            cost: p.totalCost,
-            unrealizedPnL: p.currentMarketValue - p.totalCost
-          }))
-        };
-
-        await this.dbManager.savePortfolioSnapshot(snapshot);
-        snapshots.push(snapshot);
-      }
-
-      return snapshots;
+      await snapshot.save();
+      
+      return snapshot;
     } catch (error) {
       logger.error('Error creating portfolio snapshot:', error);
       throw error;
@@ -714,7 +819,7 @@ class PortfolioCalculatorService {
     
     snapshots.forEach(snapshot => {
       let key;
-      const date = new Date(snapshot.snapshotDate);
+      const date = new Date(snapshot.date);
       
       switch (groupBy) {
         case 'day':
@@ -743,9 +848,9 @@ class PortfolioCalculatorService {
       }
       
       const group = grouped.get(key);
-      group.totalValue += snapshot.totalValue || 0;
-      group.totalCost += snapshot.totalCost || 0;
-      group.totalPnL += snapshot.totalPnL || 0;
+      group.totalValue += snapshot.currentValue || 0;
+      group.totalCost += snapshot.totalInvestment || 0;
+      group.totalPnL += snapshot.unrealizedPnl || 0;
       group.count++;
     });
     
@@ -768,23 +873,22 @@ class PortfolioCalculatorService {
       };
     }
 
-    // Sort by date
     const sorted = [...snapshots].sort((a, b) => 
-      new Date(a.snapshotDate) - new Date(b.snapshotDate)
+      new Date(a.date) - new Date(b.date)
     );
 
     const first = sorted[0];
     const last = sorted[sorted.length - 1];
-    const totalReturn = last.totalValue - first.totalValue;
-    const totalReturnPercent = first.totalValue > 0 
-      ? (totalReturn / first.totalValue) * 100 
+    const totalReturn = last.currentValue - first.currentValue;
+    const totalReturnPercent = first.currentValue > 0 
+      ? (totalReturn / first.currentValue) * 100 
       : 0;
 
     // Calculate daily returns for volatility
     const dailyReturns = [];
     for (let i = 1; i < sorted.length; i++) {
-      const prevValue = sorted[i - 1].totalValue;
-      const currValue = sorted[i].totalValue;
+      const prevValue = sorted[i - 1].currentValue;
+      const currValue = sorted[i].currentValue;
       if (prevValue > 0) {
         dailyReturns.push((currValue - prevValue) / prevValue);
       }
@@ -823,30 +927,27 @@ class PortfolioCalculatorService {
       let key;
       switch (groupBy) {
         case 'month':
-          key = dividend.paymentDate ? dividend.paymentDate.substring(0, 7) : 'Unknown';
+          key = dividend.transactionDate ? 
+            new Date(dividend.transactionDate).toISOString().substring(0, 7) : 'Unknown';
           break;
         case 'quarter':
-          if (dividend.paymentDate) {
-            const date = new Date(dividend.paymentDate);
+          if (dividend.transactionDate) {
+            const date = new Date(dividend.transactionDate);
             key = `${date.getFullYear()}-Q${Math.floor(date.getMonth() / 3) + 1}`;
           } else {
             key = 'Unknown';
           }
           break;
         case 'year':
-          key = dividend.paymentDate ? dividend.paymentDate.substring(0, 4) : 'Unknown';
+          key = dividend.transactionDate ? 
+            new Date(dividend.transactionDate).getFullYear().toString() : 'Unknown';
           break;
         case 'symbol':
           key = dividend.symbol;
           break;
-        case 'account':
-          key = `${dividend.accountId}-${dividend.accountName || 'Unknown'}`;
-          break;
-        case 'person':
-          key = dividend.personName || 'Unknown';
-          break;
         default:
-          key = dividend.paymentDate ? dividend.paymentDate.substring(0, 7) : 'Unknown';
+          key = dividend.transactionDate ? 
+            new Date(dividend.transactionDate).toISOString().substring(0, 7) : 'Unknown';
       }
 
       if (!grouped.has(key)) {
@@ -854,72 +955,33 @@ class PortfolioCalculatorService {
           period: key,
           totalAmount: 0,
           count: 0,
-          symbols: new Set(),
-          accounts: new Set(),
-          persons: new Set()
+          symbols: new Set()
         });
       }
 
       const group = grouped.get(key);
-      group.totalAmount += dividend.amount || 0;
+      group.totalAmount += Math.abs(dividend.netAmount || 0);
       group.count += 1;
       group.symbols.add(dividend.symbol);
-      if (dividend.accountId) group.accounts.add(dividend.accountId);
-      if (dividend.personName) group.persons.add(dividend.personName);
     });
 
     return Array.from(grouped.values()).map(g => ({
       ...g,
       symbols: Array.from(g.symbols),
-      symbolCount: g.symbols.size,
-      accounts: Array.from(g.accounts),
-      accountCount: g.accounts.size,
-      persons: Array.from(g.persons),
-      personCount: g.persons.size
+      symbolCount: g.symbols.size
     })).sort((a, b) => b.period.localeCompare(a.period));
   }
 
-  buildDividendCalendar(positions, dividendInfo, historicalDividends, options) {
-    const { startDate, endDate, groupBy } = options;
+  buildDividendCalendar(positions, dividendActivities, options) {
     const calendar = [];
 
-    // Build calendar entries from dividend info and positions
-    dividendInfo.forEach(info => {
-      if (!info.isDividendStock) return;
-
-      const relevantPositions = positions.filter(p => p.symbol === info.symbol);
-      if (relevantPositions.length === 0) return;
-
-      const totalShares = relevantPositions.reduce((sum, p) => sum + (p.openQuantity || 0), 0);
-      const estimatedAmount = totalShares * (info.dividendPerShare || 0);
-
-      calendar.push({
-        symbol: info.symbol,
-        exDividendDate: info.exDividendDate,
-        paymentDate: info.paymentDate,
-        dividendPerShare: info.dividendPerShare,
-        dividendYield: info.dividendYield,
-        frequency: info.dividendFrequency,
-        totalShares,
-        estimatedAmount,
-        accounts: relevantPositions.map(p => ({
-          accountId: p.accountId,
-          accountName: p.accountName,
-          personName: p.personName,
-          shares: p.openQuantity
-        }))
-      });
-    });
-
     // Add historical dividends
-    historicalDividends.forEach(dividend => {
+    dividendActivities.forEach(dividend => {
       calendar.push({
         symbol: dividend.symbol,
-        paymentDate: dividend.paymentDate,
-        dividendPerShare: dividend.dividendPerShare,
-        amount: dividend.amount,
+        paymentDate: dividend.transactionDate,
+        amount: Math.abs(dividend.netAmount || 0),
         accountId: dividend.accountId,
-        accountName: dividend.accountName,
         personName: dividend.personName,
         isHistorical: true
       });
@@ -927,45 +989,33 @@ class PortfolioCalculatorService {
 
     // Sort by payment date
     calendar.sort((a, b) => {
-      const dateA = new Date(a.paymentDate || a.exDividendDate);
-      const dateB = new Date(b.paymentDate || b.exDividendDate);
+      const dateA = new Date(a.paymentDate);
+      const dateB = new Date(b.paymentDate);
       return dateA - dateB;
     });
 
     return calendar;
   }
 
-  calculateAnnualDividends(positions, dividendInfo) {
-    let totalAnnual = 0;
-
-    dividendInfo.forEach(info => {
-      if (!info.isDividendStock) return;
-
-      const relevantPositions = positions.filter(p => p.symbol === info.symbol);
-      const totalShares = relevantPositions.reduce((sum, p) => sum + (p.openQuantity || 0), 0);
-      
-      // Calculate based on frequency
-      let paymentsPerYear = 4; // Default quarterly
-      if (info.dividendFrequency === 'Monthly') paymentsPerYear = 12;
-      else if (info.dividendFrequency === 'Annual') paymentsPerYear = 1;
-      else if (info.dividendFrequency === 'Semi-Annual') paymentsPerYear = 2;
-
-      totalAnnual += totalShares * (info.dividendPerShare || 0) * paymentsPerYear;
-    });
-
-    return totalAnnual;
+  calculateAnnualDividends(positions) {
+    return positions.reduce((sum, position) => {
+      if (position.dividendData) {
+        return sum + (position.dividendData.annualDividend || 0);
+      }
+      return sum;
+    }, 0);
   }
 
-  calculateAverageYield(positions, dividendInfo) {
+  calculateAverageYield(positions) {
     let totalValue = 0;
     let totalDividendValue = 0;
 
     positions.forEach(position => {
-      const info = dividendInfo.find(d => d.symbol === position.symbol);
-      if (info && info.isDividendStock) {
+      if (position.isDividendStock && position.dividendData) {
         const positionValue = position.currentMarketValue || 0;
         totalValue += positionValue;
-        totalDividendValue += positionValue * (info.dividendYield || 0) / 100;
+        const annualDividend = position.dividendData.annualDividend || 0;
+        totalDividendValue += annualDividend;
       }
     });
 
@@ -1034,12 +1084,11 @@ class PortfolioCalculatorService {
     const groups = new Map();
     
     positions.forEach(position => {
-      const accountKey = `${position.accountId}-${position.accountName}`;
+      const accountKey = position.accountId;
       if (!groups.has(accountKey)) {
         groups.set(accountKey, {
-          name: position.accountName || position.accountId,
+          name: position.accountId,
           accountId: position.accountId,
-          accountType: position.accountType,
           personName: position.personName,
           value: 0,
           cost: 0,
@@ -1097,8 +1146,6 @@ class PortfolioCalculatorService {
 
   async allocateBySector(positions) {
     try {
-      // This would require fetching sector data for each symbol
-      // For now, using a mock implementation
       const sectorMap = {
         'Technology': ['AAPL', 'MSFT', 'GOOGL', 'META', 'NVDA'],
         'Financial': ['JPM', 'BAC', 'WFC', 'GS', 'MS', 'TD.TO', 'RY.TO', 'BNS.TO'],
@@ -1149,7 +1196,6 @@ class PortfolioCalculatorService {
       }));
     } catch (error) {
       logger.error('Error allocating by sector:', error);
-      // Fallback to type allocation
       return this.allocateByType(positions);
     }
   }

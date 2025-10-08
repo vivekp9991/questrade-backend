@@ -2,22 +2,26 @@
 const express = require('express');
 const router = express.Router();
 const logger = require('../utils/logger');
+const Position = require('../models/Position');
+const Account = require('../models/Account');
+const Activity = require('../models/Activity');
+const PortfolioSnapshot = require('../models/PortfolioSnapshot');
+const Symbol = require('../models/Symbol');
+const Person = require('../models/Person');
 const PortfolioCalculatorService = require('../services/portfolioCalculator');
-const DatabaseManager = require('../services/databaseManager');
-const QueueManager = require('../services/queueManager');
 const AccountAggregator = require('../services/accountAggregator');
+const dataSync = require('../services/dataSync');
+const { asyncHandler } = require('../middleware/errorHandler');
 
 // Initialize services
-const dbManager = new DatabaseManager();
-const queueManager = new QueueManager();
-const portfolioCalculator = new PortfolioCalculatorService(dbManager, queueManager);
-const accountAggregator = new AccountAggregator(dbManager);
+const portfolioCalculator = new PortfolioCalculatorService();
+const accountAggregator = new AccountAggregator();
 
 /**
  * GET /api/portfolio/summary
  * Get portfolio summary with various view modes
  */
-router.get('/summary', async (req, res, next) => {
+router.get('/summary', asyncHandler(async (req, res) => {
   try {
     const { 
       viewMode = 'all', 
@@ -39,7 +43,6 @@ router.get('/summary', async (req, res, next) => {
     }
 
     if (viewMode === 'account' && !accountId) {
-      // If no accountId provided with account viewMode, return error
       return res.status(400).json({
         success: false,
         error: 'accountId is required when viewMode is "account"'
@@ -62,15 +65,19 @@ router.get('/summary', async (req, res, next) => {
     });
   } catch (error) {
     logger.error('Error getting portfolio summary:', error);
-    next(error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to get portfolio summary',
+      message: error.message
+    });
   }
-});
+}));
 
 /**
  * GET /api/portfolio/positions
  * Get all positions with optional filters
  */
-router.get('/positions', async (req, res, next) => {
+router.get('/positions', asyncHandler(async (req, res) => {
   try {
     const { 
       viewMode = 'all',
@@ -117,15 +124,19 @@ router.get('/positions', async (req, res, next) => {
     });
   } catch (error) {
     logger.error('Error getting positions:', error);
-    next(error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to get positions',
+      message: error.message
+    });
   }
-});
+}));
 
 /**
  * GET /api/portfolio/positions/:symbol
  * Get details for a specific position
  */
-router.get('/positions/:symbol', async (req, res, next) => {
+router.get('/positions/:symbol', asyncHandler(async (req, res) => {
   try {
     const { symbol } = req.params;
     const { accountId, personName } = req.query;
@@ -138,7 +149,7 @@ router.get('/positions/:symbol', async (req, res, next) => {
     if (personName) filter.personName = personName;
 
     // Get position details from database
-    const positions = await dbManager.getPositions(filter);
+    const positions = await Position.find(filter).lean();
 
     if (!positions || positions.length === 0) {
       return res.status(404).json({
@@ -148,36 +159,11 @@ router.get('/positions/:symbol', async (req, res, next) => {
       });
     }
 
-    // If specific account/person requested, return single position
+    // If specific account requested, return single position
     if (accountId && positions.length === 1) {
       const position = positions[0];
-      const enrichedPosition = {
-        symbol: position.symbol,
-        symbolId: position.symbolId,
-        accountId: position.accountId,
-        accountName: position.accountName,
-        accountType: position.accountType,
-        personName: position.personName,
-        quantity: position.openQuantity || 0,
-        averageEntryPrice: position.averageEntryPrice || 0,
-        currentPrice: position.currentPrice || 0,
-        totalCost: position.totalCost || 0,
-        marketValue: position.currentMarketValue || 0,
-        unrealizedPnL: (position.currentMarketValue || 0) - (position.totalCost || 0),
-        unrealizedPnLPercent: position.totalCost > 0 
-          ? ((position.currentMarketValue - position.totalCost) / position.totalCost) * 100 
-          : 0,
-        dayPnL: position.dayPnL || 0,
-        dayPnLPercent: position.dayPnLPercent || 0,
-        currency: position.currency,
-        securityType: position.securityType,
-        isDividendStock: position.isDividendStock || false,
-        dividendYield: position.dividendYield || 0,
-        annualDividend: position.annualDividend || 0,
-        dividendData: position.dividendData,
-        lastUpdated: position.lastUpdated
-      };
-
+      const enrichedPosition = portfolioCalculator.enrichPosition(position);
+      
       return res.json({
         success: true,
         data: enrichedPosition,
@@ -185,70 +171,8 @@ router.get('/positions/:symbol', async (req, res, next) => {
       });
     }
 
-    // Otherwise, return aggregated position across accounts
-    const aggregatedPosition = {
-      symbol: positions[0].symbol,
-      symbolId: positions[0].symbolId,
-      totalQuantity: 0,
-      totalCost: 0,
-      totalMarketValue: 0,
-      currentPrice: positions[0].currentPrice,
-      currency: positions[0].currency,
-      securityType: positions[0].securityType,
-      isDividendStock: positions[0].isDividendStock || false,
-      dividendYield: positions[0].dividendYield || 0,
-      annualDividend: positions[0].annualDividend || 0,
-      accounts: [],
-      persons: new Set(),
-      lastUpdated: positions[0].lastUpdated
-    };
-
-    positions.forEach(position => {
-      aggregatedPosition.totalQuantity += position.openQuantity || 0;
-      aggregatedPosition.totalCost += position.totalCost || 0;
-      aggregatedPosition.totalMarketValue += position.currentMarketValue || 0;
-      
-      if (position.personName) {
-        aggregatedPosition.persons.add(position.personName);
-      }
-      
-      aggregatedPosition.accounts.push({
-        accountId: position.accountId,
-        accountName: position.accountName,
-        accountType: position.accountType,
-        personName: position.personName,
-        quantity: position.openQuantity,
-        cost: position.totalCost,
-        marketValue: position.currentMarketValue,
-        averageEntryPrice: position.averageEntryPrice,
-        unrealizedPnL: (position.currentMarketValue || 0) - (position.totalCost || 0),
-        unrealizedPnLPercent: position.totalCost > 0 
-          ? ((position.currentMarketValue - position.totalCost) / position.totalCost) * 100 
-          : 0,
-        dividendData: position.dividendData
-      });
-
-      // Update price if more recent
-      if (position.lastUpdated > aggregatedPosition.lastUpdated) {
-        aggregatedPosition.currentPrice = position.currentPrice;
-        aggregatedPosition.lastUpdated = position.lastUpdated;
-      }
-    });
-
-    // Calculate aggregate metrics
-    aggregatedPosition.averageEntryPrice = aggregatedPosition.totalQuantity > 0 
-      ? aggregatedPosition.totalCost / aggregatedPosition.totalQuantity 
-      : 0;
-    aggregatedPosition.unrealizedPnL = aggregatedPosition.totalMarketValue - aggregatedPosition.totalCost;
-    aggregatedPosition.unrealizedPnLPercent = aggregatedPosition.totalCost > 0 
-      ? (aggregatedPosition.unrealizedPnL / aggregatedPosition.totalCost) * 100 
-      : 0;
-    aggregatedPosition.accountCount = aggregatedPosition.accounts.length;
-    aggregatedPosition.personCount = aggregatedPosition.persons.size;
-    aggregatedPosition.persons = Array.from(aggregatedPosition.persons);
-    aggregatedPosition.totalAnnualDividend = aggregatedPosition.isDividendStock 
-      ? aggregatedPosition.totalQuantity * aggregatedPosition.annualDividend 
-      : 0;
+    // Otherwise, aggregate positions across accounts
+    const aggregatedPosition = portfolioCalculator.aggregatePositionsBySymbol(positions, symbol);
 
     res.json({
       success: true,
@@ -257,15 +181,19 @@ router.get('/positions/:symbol', async (req, res, next) => {
     });
   } catch (error) {
     logger.error('Error getting position details:', error);
-    next(error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to get position details',
+      message: error.message
+    });
   }
-});
+}));
 
 /**
  * GET /api/portfolio/cash-balances
  * Get cash balances with various view modes
  */
-router.get('/cash-balances', async (req, res, next) => {
+router.get('/cash-balances', asyncHandler(async (req, res) => {
   try {
     const { 
       viewMode = 'all',
@@ -280,14 +208,14 @@ router.get('/cash-balances', async (req, res, next) => {
     const filter = {};
     if (accountId) filter.accountId = accountId;
     if (personName) filter.personName = personName;
-    if (currency) filter.currency = currency;
 
-    // Get cash balances from database
-    const balances = await dbManager.getCashBalances(filter);
+    // Get accounts with balances
+    const accounts = await Account.find(filter).lean();
 
-    // Aggregate based on view mode
-    const aggregatedBalances = await accountAggregator.aggregateCashBalances(
-      balances,
+    // Extract and aggregate cash balances
+    const cashBalances = portfolioCalculator.extractCashBalances(accounts);
+    const aggregatedBalances = accountAggregator.aggregateCashBalances(
+      cashBalances,
       viewMode,
       { accountId, personName, currency }
     );
@@ -299,15 +227,19 @@ router.get('/cash-balances', async (req, res, next) => {
     });
   } catch (error) {
     logger.error('Error getting cash balances:', error);
-    next(error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to get cash balances',
+      message: error.message
+    });
   }
-});
+}));
 
 /**
  * GET /api/portfolio/dividends/calendar
  * Get dividend calendar
  */
-router.get('/dividends/calendar', async (req, res, next) => {
+router.get('/dividends/calendar', asyncHandler(async (req, res) => {
   try {
     const { 
       viewMode = 'all',
@@ -336,15 +268,19 @@ router.get('/dividends/calendar', async (req, res, next) => {
     });
   } catch (error) {
     logger.error('Error getting dividend calendar:', error);
-    next(error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to get dividend calendar',
+      message: error.message
+    });
   }
-});
+}));
 
 /**
  * GET /api/portfolio/performance
  * Get portfolio performance metrics
  */
-router.get('/performance', async (req, res, next) => {
+router.get('/performance', asyncHandler(async (req, res) => {
   try {
     const { 
       accountId,
@@ -367,15 +303,19 @@ router.get('/performance', async (req, res, next) => {
     });
   } catch (error) {
     logger.error('Error getting performance metrics:', error);
-    next(error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to get performance metrics',
+      message: error.message
+    });
   }
-});
+}));
 
 /**
  * GET /api/portfolio/dividends
  * Get dividend information
  */
-router.get('/dividends', async (req, res, next) => {
+router.get('/dividends', asyncHandler(async (req, res) => {
   try {
     const { 
       accountId,
@@ -400,15 +340,19 @@ router.get('/dividends', async (req, res, next) => {
     });
   } catch (error) {
     logger.error('Error getting dividend summary:', error);
-    next(error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to get dividend summary',
+      message: error.message
+    });
   }
-});
+}));
 
 /**
  * GET /api/portfolio/snapshots
  * Get portfolio snapshots
  */
-router.get('/snapshots', async (req, res, next) => {
+router.get('/snapshots', asyncHandler(async (req, res) => {
   try {
     const { 
       viewMode = 'all',
@@ -422,96 +366,42 @@ router.get('/snapshots', async (req, res, next) => {
     logger.info('Getting portfolio snapshots', { viewMode, accountId, personName, limit });
 
     // Build filter
-    const filter = {};
+    const filter = { viewMode };
     if (accountId) filter.accountId = accountId;
     if (personName) filter.personName = personName;
-    if (startDate) filter.startDate = startDate;
-    if (endDate) filter.endDate = endDate;
-    filter.limit = parseInt(limit);
+    if (startDate) filter.date = { $gte: new Date(startDate) };
+    if (endDate) {
+      filter.date = filter.date || {};
+      filter.date.$lte = new Date(endDate);
+    }
 
     // Get snapshots from database
-    const snapshots = await dbManager.getPortfolioSnapshots(filter);
-
-    // Process snapshots based on view mode
-    let processedSnapshots = snapshots;
-    
-    if (viewMode === 'account' && accountId) {
-      // Filter for specific account (already done in query)
-      processedSnapshots = snapshots;
-    } else if (viewMode === 'person' && personName) {
-      // Filter for specific person (already done in query)
-      processedSnapshots = snapshots;
-    } else if (viewMode === 'all') {
-      // Aggregate snapshots across all accounts by date
-      const aggregatedByDate = new Map();
-      
-      snapshots.forEach(snapshot => {
-        const dateKey = snapshot.snapshotDate;
-        
-        if (!aggregatedByDate.has(dateKey)) {
-          aggregatedByDate.set(dateKey, {
-            snapshotDate: dateKey,
-            totalValue: 0,
-            totalCost: 0,
-            totalPnL: 0,
-            totalPnLPercent: 0,
-            dayPnL: 0,
-            dayPnLPercent: 0,
-            accounts: [],
-            persons: new Set()
-          });
-        }
-        
-        const agg = aggregatedByDate.get(dateKey);
-        agg.totalValue += snapshot.totalValue || 0;
-        agg.totalCost += snapshot.totalCost || 0;
-        agg.totalPnL += snapshot.totalPnL || 0;
-        agg.dayPnL += snapshot.dayPnL || 0;
-        agg.accounts.push({
-          accountId: snapshot.accountId,
-          accountName: snapshot.accountName,
-          personName: snapshot.personName,
-          value: snapshot.totalValue
-        });
-        if (snapshot.personName) {
-          agg.persons.add(snapshot.personName);
-        }
-      });
-      
-      // Calculate percentages
-      aggregatedByDate.forEach(agg => {
-        agg.totalPnLPercent = agg.totalCost > 0 
-          ? (agg.totalPnL / agg.totalCost) * 100 
-          : 0;
-        agg.dayPnLPercent = (agg.totalValue - agg.dayPnL) > 0
-          ? (agg.dayPnL / (agg.totalValue - agg.dayPnL)) * 100
-          : 0;
-        agg.personCount = agg.persons.size;
-        agg.persons = Array.from(agg.persons);
-      });
-      
-      processedSnapshots = Array.from(aggregatedByDate.values())
-        .sort((a, b) => new Date(b.snapshotDate) - new Date(a.snapshotDate))
-        .slice(0, parseInt(limit));
-    }
+    const snapshots = await PortfolioSnapshot.find(filter)
+      .sort({ date: -1 })
+      .limit(parseInt(limit))
+      .lean();
 
     res.json({
       success: true,
-      data: processedSnapshots,
-      count: processedSnapshots.length,
+      data: snapshots,
+      count: snapshots.length,
       timestamp: new Date().toISOString()
     });
   } catch (error) {
     logger.error('Error getting portfolio snapshots:', error);
-    next(error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to get portfolio snapshots',
+      message: error.message
+    });
   }
-});
+}));
 
 /**
  * POST /api/portfolio/snapshot
  * Create a new portfolio snapshot
  */
-router.post('/snapshot', async (req, res, next) => {
+router.post('/snapshot', asyncHandler(async (req, res) => {
   try {
     const { accountId, personName } = req.body;
 
@@ -525,15 +415,19 @@ router.post('/snapshot', async (req, res, next) => {
     });
   } catch (error) {
     logger.error('Error creating portfolio snapshot:', error);
-    next(error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to create portfolio snapshot',
+      message: error.message
+    });
   }
-});
+}));
 
 /**
  * GET /api/portfolio/allocation
  * Get portfolio allocation breakdown
  */
-router.get('/allocation', async (req, res, next) => {
+router.get('/allocation', asyncHandler(async (req, res) => {
   try {
     const { 
       accountId,
@@ -554,15 +448,19 @@ router.get('/allocation', async (req, res, next) => {
     });
   } catch (error) {
     logger.error('Error getting portfolio allocation:', error);
-    next(error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to get portfolio allocation',
+      message: error.message
+    });
   }
-});
+}));
 
 /**
  * GET /api/portfolio/transactions
  * Get recent transactions
  */
-router.get('/transactions', async (req, res, next) => {
+router.get('/transactions', asyncHandler(async (req, res) => {
   try {
     const { 
       accountId,
@@ -579,11 +477,16 @@ router.get('/transactions', async (req, res, next) => {
     if (personName) filter.personName = personName;
     if (symbol) filter.symbol = symbol;
     if (type) filter.type = type;
-    if (startDate) filter.startDate = startDate;
-    if (endDate) filter.endDate = endDate;
-    filter.limit = parseInt(limit);
+    if (startDate || endDate) {
+      filter.transactionDate = {};
+      if (startDate) filter.transactionDate.$gte = new Date(startDate);
+      if (endDate) filter.transactionDate.$lte = new Date(endDate);
+    }
 
-    const transactions = await dbManager.getTransactions(filter);
+    const transactions = await Activity.find(filter)
+      .sort({ transactionDate: -1 })
+      .limit(parseInt(limit))
+      .lean();
 
     res.json({
       success: true,
@@ -593,69 +496,120 @@ router.get('/transactions', async (req, res, next) => {
     });
   } catch (error) {
     logger.error('Error getting transactions:', error);
-    next(error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to get transactions',
+      message: error.message
+    });
   }
-});
+}));
 
 /**
  * POST /api/portfolio/sync
  * Trigger portfolio data sync
  */
-router.post('/sync', async (req, res, next) => {
+router.post('/sync', asyncHandler(async (req, res) => {
   try {
     const { personName, accountId, fullSync = false } = req.body;
 
-    // Add sync job to queue
-    await queueManager.addJob('portfolio.sync', {
-      personName,
-      accountId,
-      fullSync
-    });
+    if (!personName) {
+      return res.status(400).json({
+        success: false,
+        error: 'personName is required for sync'
+      });
+    }
+
+    // Use dataSync service directly
+    logger.info(`Initiating sync for ${personName}`, { fullSync });
+    
+    // Run sync asynchronously
+    dataSync.syncPersonData(personName, { fullSync })
+      .then(result => {
+        logger.info(`Sync completed for ${personName}`, result);
+      })
+      .catch(error => {
+        logger.error(`Sync failed for ${personName}:`, error);
+      });
 
     res.json({
       success: true,
       message: 'Portfolio sync initiated',
+      personName,
+      fullSync,
       timestamp: new Date().toISOString()
     });
   } catch (error) {
     logger.error('Error initiating portfolio sync:', error);
-    next(error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to initiate portfolio sync',
+      message: error.message
+    });
   }
-});
+}));
 
 /**
  * POST /api/portfolio/refresh
  * Trigger portfolio data refresh (legacy endpoint)
  */
-router.post('/refresh', async (req, res, next) => {
+router.post('/refresh', asyncHandler(async (req, res) => {
   try {
     const { accountId, force = false } = req.body;
 
-    await queueManager.addJob('portfolio.refresh', {
-      accountId,
-      force
-    });
+    if (!accountId) {
+      return res.status(400).json({
+        success: false,
+        error: 'accountId is required for refresh'
+      });
+    }
+
+    // Get account to find personName
+    const account = await Account.findOne({ accountId });
+    if (!account) {
+      return res.status(404).json({
+        success: false,
+        error: 'Account not found'
+      });
+    }
+
+    // Use dataSync service
+    dataSync.syncPersonData(account.personName, { fullSync: force })
+      .then(result => {
+        logger.info(`Refresh completed for account ${accountId}`, result);
+      })
+      .catch(error => {
+        logger.error(`Refresh failed for account ${accountId}:`, error);
+      });
 
     res.json({
       success: true,
       message: 'Portfolio refresh initiated',
+      accountId,
       timestamp: new Date().toISOString()
     });
   } catch (error) {
     logger.error('Error initiating portfolio refresh:', error);
-    next(error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to initiate portfolio refresh',
+      message: error.message
+    });
   }
-});
+}));
 
 /**
  * GET /api/portfolio/watchlist
  * Get watchlist
  */
-router.get('/watchlist', async (req, res, next) => {
+router.get('/watchlist', asyncHandler(async (req, res) => {
   try {
     const { personName } = req.query;
 
-    const watchlist = await dbManager.getWatchlist(personName);
+    const filter = {};
+    if (personName) filter.personName = personName;
+
+    // For now, return empty watchlist as this feature isn't implemented
+    const watchlist = [];
 
     res.json({
       success: true,
@@ -664,59 +618,61 @@ router.get('/watchlist', async (req, res, next) => {
     });
   } catch (error) {
     logger.error('Error getting watchlist:', error);
-    next(error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to get watchlist',
+      message: error.message
+    });
   }
-});
+}));
 
 /**
  * POST /api/portfolio/watchlist
  * Add symbol to watchlist
  */
-router.post('/watchlist', async (req, res, next) => {
+router.post('/watchlist', asyncHandler(async (req, res) => {
   try {
     const { personName, symbol, notes } = req.body;
 
-    const result = await dbManager.addToWatchlist({
-      personName,
-      symbol,
-      notes
-    });
-
+    // For now, return success without actually implementing watchlist
     res.json({
       success: true,
-      data: result,
-      message: 'Symbol added to watchlist',
+      message: 'Watchlist feature not yet implemented',
       timestamp: new Date().toISOString()
     });
   } catch (error) {
     logger.error('Error adding to watchlist:', error);
-    next(error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to add to watchlist',
+      message: error.message
+    });
   }
-});
+}));
 
 /**
  * DELETE /api/portfolio/watchlist/:symbol
  * Remove symbol from watchlist
  */
-router.delete('/watchlist/:symbol', async (req, res, next) => {
+router.delete('/watchlist/:symbol', asyncHandler(async (req, res) => {
   try {
     const { symbol } = req.params;
     const { personName } = req.query;
 
-    await dbManager.removeFromWatchlist({
-      personName,
-      symbol
-    });
-
+    // For now, return success without actually implementing watchlist
     res.json({
       success: true,
-      message: 'Symbol removed from watchlist',
+      message: 'Watchlist feature not yet implemented',
       timestamp: new Date().toISOString()
     });
   } catch (error) {
     logger.error('Error removing from watchlist:', error);
-    next(error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to remove from watchlist',
+      message: error.message
+    });
   }
-});
+}));
 
 module.exports = router;
